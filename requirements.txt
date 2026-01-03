@@ -1,0 +1,11 @@
+# NexRecon - Requirements
+# Install with: pip install -r requirements.txt
+
+# HTTP Requests
+requests>=2.28.0
+
+# Phone number parsing and validation
+phonenumbers>=8.13.0
+
+# Image metadata extraction (EXIF)
+Pillow>=9.0.0
