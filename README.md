@@ -187,7 +187,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 **Kumar Devashish**
 
-- GitHub: [@kumardevashish](https://github.com/kumardevashish)
+- GitHub: [@kumardevashish](https://github.com/kumar10248)
 
 ---
 
@@ -197,7 +197,6 @@ Give a ⭐ if this project helped you!
 
 ---
 
-## 📝 Changelog
 
 ### Version 1.0.0 (January 2026)
 - ✨ New categorized menu interface
