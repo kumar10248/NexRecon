@@ -199,7 +199,7 @@ Give a ⭐ if this project helped you!
 
 ## 📝 Changelog
 
-### Version 3.0 (January 2026)
+### Version 1.0.0 (January 2026)
 - ✨ New categorized menu interface
 - 🎨 Improved UI with animations
 - 🔒 Added Port Scanner
@@ -210,13 +210,4 @@ Give a ⭐ if this project helped you!
 - 🌐 Improved WHOIS with multiple API fallbacks
 - 🐛 Better error handling throughout
 
-### Version 2.0
-- Added Username Search
-- Added WHOIS Lookup
-- Added DNS Lookup
-- Added Website Header Analysis
 
-### Version 1.0
-- Initial release
-- IP Tracker
-- Phone Number Tracker
