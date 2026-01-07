@@ -21,6 +21,16 @@ from functools import wraps
 from typing import Callable, Any, Optional, List, Dict
 from urllib.parse import urlparse
 from datetime import datetime
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Optional imports for async email checking (holehe-style)
+try:
+    import httpx
+    import trio
+    ASYNC_AVAILABLE = True
+except ImportError:
+    ASYNC_AVAILABLE = False
 
 # Optional imports for image metadata extraction
 try:
@@ -401,6 +411,1996 @@ def phoneGW():
         print(f"{Re}Error: {e}")
 
 
+# ============== EMAIL FOOTPRINT CHECKER (HOLEHE-STYLE) ==============
+
+def get_random_useragent():
+    """Generate a random user agent string."""
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    ]
+    return secrets.choice(user_agents)
+
+
+def check_email_on_site(site_name: str, domain: str, email: str) -> dict:
+    """Check if email is registered on a specific website."""
+    result = {
+        'name': site_name,
+        'domain': domain,
+        'exists': False,
+        'rateLimit': False,
+        'error': False,
+        'emailrecovery': None,
+        'phoneNumber': None,
+        'others': None
+    }
+    
+    headers = {
+        'User-Agent': get_random_useragent(),
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Origin': f'https://{domain}',
+        'Referer': f'https://{domain}/',
+    }
+    
+    # Create a fresh session for each check to avoid cookie issues
+    session = requests.Session()
+    
+    try:
+        # ===== GRAVATAR =====
+        if site_name == 'gravatar':
+            email_hash = hashlib.md5(email.lower().strip().encode()).hexdigest()
+            url = f"https://www.gravatar.com/avatar/{email_hash}?d=404"
+            response = session.get(url, headers=headers, timeout=8)
+            result['exists'] = response.status_code == 200
+            
+        # ===== SPOTIFY =====
+        elif site_name == 'spotify':
+            # Updated Spotify endpoint
+            spotify_headers = {
+                'User-Agent': get_random_useragent(),
+                'Accept': 'application/json',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Content-Type': 'application/x-www-form-urlencoded',
+            }
+            url = f"https://spclient.wg.spotify.com/signup/public/v1/account?validate=1&email={email}"
+            response = session.get(url, headers=spotify_headers, timeout=10)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    status = data.get('status', 0)
+                    # status 20 = email exists, status 1 = email available
+                    result['exists'] = (status == 20)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                
+        # ===== TWITTER/X =====
+        elif site_name == 'twitter':
+            # Twitter API is heavily restricted, mark as unable to check
+            result['error'] = True
+            result['others'] = {'Message': 'API restricted'}
+                
+        # ===== GITHUB =====
+        elif site_name == 'github':
+            # Method 1: Search by email in public profiles (most reliable)
+            try:
+                url = f"https://api.github.com/search/users?q={email}+in:email"
+                github_headers = headers.copy()
+                github_headers['Accept'] = 'application/vnd.github.v3+json'
+                response = session.get(url, headers=github_headers, timeout=8)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('total_count', 0) > 0:
+                        result['exists'] = True
+                        users = data.get('items', [])
+                        if users:
+                            result['others'] = {'Username': users[0].get('login', '')}
+                elif response.status_code == 403 or response.status_code == 429:
+                    result['rateLimit'] = True
+            except:
+                result['error'] = True
+            
+            # Method 2: Search commits by author email
+            if not result['exists'] and not result['rateLimit'] and not result['error']:
+                try:
+                    url = f"https://api.github.com/search/commits?q=author-email:{email}"
+                    commit_headers = headers.copy()
+                    commit_headers['Accept'] = 'application/vnd.github.cloak-preview+json'
+                    response = session.get(url, headers=commit_headers, timeout=8)
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data.get('total_count', 0) > 0:
+                            result['exists'] = True
+                    elif response.status_code == 403 or response.status_code == 429:
+                        result['rateLimit'] = True
+                except:
+                    pass
+                
+        # ===== PINTEREST =====
+        elif site_name == 'pinterest':
+            url = "https://www.pinterest.com/resource/EmailExistsResource/get/"
+            params = {
+                'source_url': '/login/',
+                'data': json.dumps({'options': {'email': email}, 'context': {}})
+            }
+            response = session.get(url, params=params, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('resource_response', {}).get('data', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== DISCORD =====
+        elif site_name == 'discord':
+            # Discord has heavy bot protection, marking as error
+            result['error'] = True
+            result['others'] = {'Message': 'Bot protection active'}
+                            
+        # ===== ADOBE =====
+        elif site_name == 'adobe':
+            # Adobe has changed their API, mark as error
+            result['error'] = True
+            result['others'] = {'Message': 'API changed'}
+                        
+        # ===== IMGUR =====
+        elif site_name == 'imgur':
+            url = "https://imgur.com/signin/ajax_email_available"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    resp_data = response.json()
+                    result['exists'] = not resp_data.get('data', {}).get('available', True)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== YAHOO =====
+        elif site_name == 'yahoo':
+            url = "https://login.yahoo.com/account/module/create?validateField=yid"
+            response = session.post(url, data={'yid': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                result['exists'] = 'IDENTIFIER_EXISTS' in response.text or 'already taken' in response.text.lower()
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                
+        # ===== SNAPCHAT ===== (API changed - can't reliably check)
+        elif site_name == 'snapchat':
+            # Snapchat's API has changed and no longer exposes email check
+            result['error'] = True
+            result['others'] = {'Message': 'API not available'}
+                
+        # ===== INSTAGRAM =====
+        elif site_name == 'instagram':
+            # Instagram has strong bot protection
+            result['error'] = True
+            result['others'] = {'Message': 'Bot protection active'}
+                    
+        # ===== WORDPRESS =====
+        elif site_name == 'wordpress':
+            url = "https://wordpress.com/wp-login.php?action=lostpassword"
+            response = session.post(url, data={'user_login': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                if 'email has been sent' in response.text.lower() or 'check your email' in response.text.lower():
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+                    
+        # ===== EBAY =====
+        elif site_name == 'ebay':
+            # eBay doesn't easily reveal email existence
+            result['error'] = True
+            result['others'] = {'Message': 'Cannot check'}
+            
+        # ===== TUMBLR =====
+        elif site_name == 'tumblr':
+            url = "https://www.tumblr.com/api/v2/register/email_check"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = not data.get('response', {}).get('available', True)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== PATREON =====
+        elif site_name == 'patreon':
+            url = "https://www.patreon.com/api/auth/email-in-use"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('data', {}).get('email_in_use', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== DUOLINGO =====
+        elif site_name == 'duolingo':
+            url = f"https://www.duolingo.com/2017-06-30/users?email={email}"
+            response = session.get(url, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    users = data.get('users', [])
+                    result['exists'] = len(users) > 0
+                    if users:
+                        user = users[0]
+                        result['others'] = {'Username': user.get('username', '')}
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== FIREFOX =====
+        elif site_name == 'firefox':
+            url = "https://api.accounts.firefox.com/v1/account/status"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== LINKEDIN =====
+        elif site_name == 'linkedin':
+            # LinkedIn API is heavily restricted
+            result['error'] = True
+            result['others'] = {'Message': 'API restricted'}
+                
+        # ===== QUORA =====
+        elif site_name == 'quora':
+            url = "https://www.quora.com/webnode2/server_call_POST"
+            json_data = {"args": [], "kwargs": {"email": email}}
+            response = session.post(url, json=json_data, headers=headers, timeout=8)
+            if response.status_code == 200 and 'true' in response.text.lower():
+                result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                
+        # ===== STRAVA =====
+        elif site_name == 'strava':
+            url = "https://www.strava.com/api/v3/oauth/email_validate"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = not data.get('available', True)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== AMAZON =====
+        elif site_name == 'amazon':
+            # Amazon has heavy bot protection
+            result['error'] = True
+            result['others'] = {'Message': 'Bot protection active'}
+                    
+        # ===== GOOGLE =====
+        elif site_name == 'google':
+            url = f"https://mail.google.com/mail/gxlu?email={email}"
+            response = session.get(url, headers=headers, timeout=8)
+            # Check if it's a valid Google account by cookie presence
+            if 'COMPASS' in response.cookies.keys():
+                result['exists'] = True
+                
+        # ===== ARCHIVEORG =====
+        elif site_name == 'archiveorg':
+            url = "https://archive.org/account/login"
+            data = {'username': email, 'submit_by_js': 'true'}
+            response = session.post(url, data=data, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    resp_data = response.json()
+                    if resp_data.get('status') == 'need_password':
+                        result['exists'] = True
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== ATLASSIAN =====
+        elif site_name == 'atlassian':
+            url = "https://id.atlassian.com/rest/check-username"
+            json_data = {'username': email}
+            atlassian_headers = headers.copy()
+            atlassian_headers['Content-Type'] = 'application/json'
+            response = session.post(url, json=json_data, headers=atlassian_headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== BITLY =====
+        elif site_name == 'bitly':
+            url = "https://bitly.com/a/sign_up_check_email"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                if 'already' in response.text.lower() or 'exists' in response.text.lower():
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== BODYBUILDING =====
+        elif site_name == 'bodybuilding':
+            url = "https://www.bodybuilding.com/api/user/email-exists"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== BUYMEACOFFEE =====
+        elif site_name == 'buymeacoffee':
+            url = f"https://www.buymeacoffee.com/api/v1/auth/check-email?email={email}"
+            response = session.get(url, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False) or data.get('registered', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== CODECADEMY =====
+        elif site_name == 'codecademy':
+            url = "https://www.codecademy.com/api/v1/accounts/email_exists"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== DELIVEROO =====
+        elif site_name == 'deliveroo':
+            url = "https://api.deliveroo.com/orderapp/v1/check-email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('registered', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== DOCKER =====
+        elif site_name == 'docker':
+            url = f"https://hub.docker.com/v2/users/{email.split('@')[0]}/"
+            response = session.get(url, headers=headers, timeout=8)
+            if response.status_code == 200:
+                result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            elif response.status_code != 404:
+                result['error'] = True
+            
+        # ===== ENVATO =====
+        elif site_name == 'envato':
+            url = "https://account.envato.com/api/v1/user/email-exists"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== EVENTBRITE =====
+        elif site_name == 'eventbrite':
+            url = "https://www.eventbrite.com/api/v3/users/lookup/"
+            params = {'email': email}
+            response = session.get(url, params=params, headers=headers, timeout=8)
+            if response.status_code == 200:
+                result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            elif response.status_code != 404:
+                result['error'] = True
+            
+        # ===== EVERNOTE =====
+        elif site_name == 'evernote':
+            url = "https://www.evernote.com/Registration.action"
+            response = session.post(url, data={'email': email, 'analyticsLoginOrigin': 'login_action'}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                if 'already' in response.text.lower() or 'exists' in response.text.lower():
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== FLIPKART =====
+        elif site_name == 'flipkart':
+            url = "https://www.flipkart.com/api/5/user/email-exists"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('RESPONSE', {}).get('emailExists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== FREELANCER =====
+        elif site_name == 'freelancer':
+            url = "https://www.freelancer.com/api/users/0.1/users/check"
+            params = {'emails[]': email}
+            response = session.get(url, params=params, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = len(data.get('result', {}).get('users', [])) > 0
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== HUBSPOT =====
+        elif site_name == 'hubspot':
+            url = "https://api.hubspot.com/login-api/v1/login/check-email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== ISSUU =====
+        elif site_name == 'issuu':
+            url = "https://api.issuu.com/v2/login"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 400:
+                result['exists'] = True  # Email exists but wrong password
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            elif response.status_code != 401:
+                result['error'] = True
+                
+        # ===== LASTFM =====
+        elif site_name == 'lastfm':
+            url = "https://www.last.fm/join/partial/validate"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = not data.get('email', {}).get('valid', True)
+                except:
+                    if 'taken' in response.text.lower() or 'already' in response.text.lower():
+                        result['exists'] = True
+                    else:
+                        result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                        
+        # ===== LAZADA =====
+        elif site_name == 'lazada':
+            url = "https://member.lazada.co.id/user/api/email-exist"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exist', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== MEWE =====
+        elif site_name == 'mewe':
+            url = "https://mewe.com/api/v2/auth/checkEmail"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== MYSPACE =====
+        elif site_name == 'myspace':
+            url = "https://myspace.com/ajax/account/validateEmail"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                if 'taken' in response.text.lower() or 'exists' in response.text.lower():
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== NIKE =====
+        elif site_name == 'nike':
+            url = "https://unite.nike.com/getUserByEmail"
+            params = {'email': email}
+            response = session.get(url, params=params, headers=headers, timeout=8)
+            if response.status_code == 200:
+                result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            elif response.status_code != 404:
+                result['error'] = True
+            
+        # ===== PICSART =====
+        elif site_name == 'picsart':
+            url = "https://api.picsart.com/users/email/check"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== PORNHUB =====
+        elif site_name == 'pornhub':
+            url = "https://www.pornhub.com/signup/check_email"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = not data.get('available', True)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== REPLIT =====
+        elif site_name == 'replit':
+            url = "https://replit.com/graphql"
+            json_data = {
+                'query': 'query { userByEmail(email: \"' + email + '\") { id username } }'
+            }
+            response = session.post(url, json=json_data, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('data', {}).get('userByEmail') is not None
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== SAMSUNG =====
+        elif site_name == 'samsung':
+            url = "https://account.samsung.com/accounts/v1/MBR/checkEmailID"
+            json_data = {'emailID': email}
+            response = session.post(url, json=json_data, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('resultCode') == '000'
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== SHOPIFY =====
+        elif site_name == 'shopify':
+            url = "https://accounts.shopify.com/lookup"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8, allow_redirects=False)
+            if response.status_code == 302:
+                result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                
+        # ===== SMULE =====
+        elif site_name == 'smule':
+            url = "https://www.smule.com/api/check_email"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = not data.get('available', True)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== SOUNDCLOUD =====
+        elif site_name == 'soundcloud':
+            url = "https://api-v2.soundcloud.com/signup/email-check"
+            params = {'email': email}
+            response = session.get(url, params=params, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('registered', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== SPOTIFY =====  (handled above)
+        
+        # ===== TOKOPEDIA =====
+        elif site_name == 'tokopedia':
+            url = "https://accounts.tokopedia.com/otp/c/ajax/email-check"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('data', {}).get('is_exist', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== TWITCH =====
+        elif site_name == 'twitch':
+            url = "https://passport.twitch.tv/usernames/check"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                if 'taken' in response.text.lower():
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== VENMO =====
+        elif site_name == 'venmo':
+            url = "https://venmo.com/api/v5/users"
+            params = {'query': email}
+            response = session.get(url, params=params, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = len(data.get('data', [])) > 0
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== VIVINO =====
+        elif site_name == 'vivino':
+            url = "https://www.vivino.com/api/login"
+            response = session.post(url, json={'email': email, 'password': 'test'}, headers=headers, timeout=8)
+            if response.status_code == 401:
+                result['exists'] = True  # Wrong password but email exists
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+                
+        # ===== WATTPAD =====
+        elif site_name == 'wattpad':
+            url = "https://www.wattpad.com/api/v3/users/check_email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== XING =====
+        elif site_name == 'xing':
+            url = "https://login.xing.com/api/login/email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                
+        # ===== ZOHO =====
+        elif site_name == 'zoho':
+            url = "https://accounts.zoho.com/accounts/validate/email"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                if 'already' in response.text.lower() or 'exists' in response.text.lower():
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+        
+        # ==================== CODING PLATFORMS ====================
+        
+        # ===== GITLAB =====
+        elif site_name == 'gitlab':
+            # Try password reset endpoint
+            url = "https://gitlab.com/users/password"
+            gitlab_headers = headers.copy()
+            gitlab_headers['Content-Type'] = 'application/x-www-form-urlencoded'
+            response = session.post(url, data={'user[email]': email}, headers=gitlab_headers, timeout=8, allow_redirects=False)
+            if response.status_code == 302 or response.status_code == 200:
+                # If redirect or success, account exists
+                result['exists'] = True
+            elif response.status_code == 422:
+                # Check response for error about email not found
+                if 'email not found' in response.text.lower():
+                    result['exists'] = False
+                else:
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== BITBUCKET =====
+        elif site_name == 'bitbucket':
+            # Use password reset endpoint
+            url = "https://bitbucket.org/account/password/reset/"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                # Check if it says email sent or no account
+                if 'no account' not in response.text.lower() and 'not found' not in response.text.lower():
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== STACKOVERFLOW =====
+        elif site_name == 'stackoverflow':
+            # Use account recovery check
+            url = "https://stackoverflow.com/users/account-recovery"
+            so_headers = headers.copy()
+            so_headers['Content-Type'] = 'application/x-www-form-urlencoded'
+            response = session.post(url, data={'email': email}, headers=so_headers, timeout=8)
+            if response.status_code == 200:
+                # If no error about email not found, account may exist
+                if 'could not find' not in response.text.lower() and 'no user' not in response.text.lower():
+                    if 'recovery' in response.text.lower() or 'sent' in response.text.lower():
+                        result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== HACKERRANK =====
+        elif site_name == 'hackerrank':
+            # Use login check endpoint - if it says "invalid login or password", account exists
+            url = "https://www.hackerrank.com/rest/auth/login"
+            hr_headers = headers.copy()
+            hr_headers['Content-Type'] = 'application/json'
+            response = session.post(url, json={'login': email, 'password': 'wrongpassword123!', 'remember_me': False}, headers=hr_headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    # "Invalid login or password" means account EXISTS but wrong password
+                    if data.get('status') == False:
+                        errors = data.get('errors', [])
+                        for err in errors:
+                            if 'invalid' in err.lower() and 'password' in err.lower():
+                                result['exists'] = True
+                                break
+                        # Also check internal status
+                        if data.get('internal_status_code') == 'login_invalid':
+                            result['exists'] = True
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== LEETCODE =====
+        elif site_name == 'leetcode':
+            # LeetCode uses Cloudflare protection - limited detection capability
+            # Try to check if username derived from email exists
+            try:
+                username = email.split('@')[0]
+                url = "https://leetcode.com/graphql/"
+                query = {
+                    "operationName": "getUserProfile",
+                    "variables": {"username": username},
+                    "query": "query getUserProfile($username: String!) { matchedUser(username: $username) { username profile { realName } } }"
+                }
+                lc_headers = headers.copy()
+                lc_headers['Content-Type'] = 'application/json'
+                response = session.post(url, json=query, headers=lc_headers, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('data', {}).get('matchedUser'):
+                        result['exists'] = True
+                        matched = data['data']['matchedUser']
+                        result['others'] = {'Username': matched.get('username', '')}
+                elif response.status_code == 429:
+                    result['rateLimit'] = True
+                else:
+                    result['error'] = True
+            except:
+                result['error'] = True
+                    
+        # ===== CODECHEF =====
+        elif site_name == 'codechef':
+            url = "https://www.codechef.com/api/user/email-exists"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False) or data.get('result', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== CODEFORCES =====
+        elif site_name == 'codeforces':
+            url = "https://codeforces.com/register"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                if 'already registered' in response.text.lower() or 'already used' in response.text.lower():
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== KAGGLE =====
+        elif site_name == 'kaggle':
+            url = "https://www.kaggle.com/api/v1/users/check-email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('isRegistered', False) or data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== CODEWARS =====
+        elif site_name == 'codewars':
+            url = "https://www.codewars.com/api/v1/users/check_email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False) or not data.get('available', True)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== EXERCISM =====
+        elif site_name == 'exercism':
+            url = "https://exercism.org/api/v2/validate_email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = not data.get('valid', True) or data.get('taken', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== FREECODECAMP =====
+        elif site_name == 'freecodecamp':
+            url = "https://api.freecodecamp.org/api/users/exists"
+            response = session.get(url, params={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== GLITCH =====
+        elif site_name == 'glitch':
+            url = "https://api.glitch.com/v1/users/by/email"
+            response = session.get(url, params={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            elif response.status_code != 404:
+                result['error'] = True
+            
+        # ===== HEROKU =====
+        elif site_name == 'heroku':
+            url = "https://id.heroku.com/account/accept/check"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== VERCEL =====
+        elif site_name == 'vercel':
+            url = "https://vercel.com/api/registration/email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200 or response.status_code == 400:
+                if 'exists' in response.text.lower() or 'already' in response.text.lower():
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== NETLIFY =====
+        elif site_name == 'netlify':
+            url = "https://api.netlify.com/api/v1/accounts/lookup"
+            response = session.get(url, params={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            elif response.status_code != 404:
+                result['error'] = True
+            
+        # ===== CODESANDBOX =====
+        elif site_name == 'codesandbox':
+            url = "https://codesandbox.io/api/v1/users/check_email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== CODEPEN =====
+        elif site_name == 'codepen':
+            url = "https://codepen.io/signup/check/email"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = not data.get('available', True)
+                except:
+                    if 'taken' in response.text.lower():
+                        result['exists'] = True
+                    else:
+                        result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                        
+        # ===== NPM =====
+        elif site_name == 'npm':
+            # Try to check via npmjs signup
+            url = "https://www.npmjs.com/signup/check-email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = not data.get('available', True)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== PYPI =====
+        elif site_name == 'pypi':
+            url = "https://pypi.org/account/register/"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                if 'already' in response.text.lower() or 'exists' in response.text.lower():
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== JETBRAINS =====
+        elif site_name == 'jetbrains':
+            url = "https://account.jetbrains.com/api/v1/accounts/check-email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('registered', False) or data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== HACKEREARTH =====
+        elif site_name == 'hackerearth':
+            url = "https://www.hackerearth.com/api/v2/auth/email-exists/"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== TOPCODER =====
+        elif site_name == 'topcoder':
+            url = "https://api.topcoder.com/v3/users/validateEmail"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = not data.get('valid', True)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== SOURCEFORGE =====
+        elif site_name == 'sourceforge':
+            url = "https://sourceforge.net/auth/signup"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                if 'already' in response.text.lower() or 'exists' in response.text.lower():
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== LAUNCHPAD =====
+        elif site_name == 'launchpad':
+            url = "https://login.launchpad.net/+login"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                if 'already' in response.text.lower():
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== GITBOOK =====
+        elif site_name == 'gitbook':
+            url = "https://api.gitbook.com/v1/auth/check-email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== DEV.TO =====
+        elif site_name == 'devto':
+            url = "https://dev.to/users/check_email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = not data.get('available', True)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== HASHNODE =====
+        elif site_name == 'hashnode':
+            url = "https://hashnode.com/api/check-email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False) or data.get('registered', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== MEDIUM =====
+        elif site_name == 'medium':
+            url = "https://medium.com/_/api/users/email-check"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    # Medium returns ])}while(1);</x> prefix
+                    text = response.text.replace("])}while(1);</x>", "")
+                    data = json.loads(text)
+                    result['exists'] = data.get('payload', {}).get('value', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== DIGITALOCEAN =====
+        elif site_name == 'digitalocean':
+            url = "https://cloud.digitalocean.com/api/v1/accounts/exists"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== RENDER =====
+        elif site_name == 'render':
+            url = "https://api.render.com/v1/check-email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== RAILWAY =====
+        elif site_name == 'railway':
+            url = "https://backboard.railway.app/graphql/v2"
+            graphql_query = {
+                'query': 'query { userByEmail(email: "' + email + '") { id } }'
+            }
+            response = session.post(url, json=graphql_query, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('data', {}).get('userByEmail') is not None
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== SUPABASE =====
+        elif site_name == 'supabase':
+            url = "https://app.supabase.com/api/auth/check-email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== FIREBASE =====
+        elif site_name == 'firebase':
+            url = "https://console.firebase.google.com/api/auth/check-email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('registered', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== POSTMAN =====
+        elif site_name == 'postman':
+            url = "https://identity.getpostman.com/api/v1/users/exists"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== FIGMA =====
+        elif site_name == 'figma':
+            url = "https://www.figma.com/api/user/email_exists"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False) or data.get('email_exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== NOTION =====
+        elif site_name == 'notion':
+            url = "https://www.notion.so/api/v3/getSpaces"
+            notion_headers = headers.copy()
+            notion_headers['Content-Type'] = 'application/json'
+            response = session.post(url, json={'email': email}, headers=notion_headers, timeout=8)
+            if response.status_code == 401:
+                result['exists'] = True  # Account exists but wrong auth
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                
+        # ===== TRELLO =====
+        elif site_name == 'trello':
+            url = f"https://trello.com/1/members/{email.split('@')[0]}"
+            response = session.get(url, headers=headers, timeout=8)
+            if response.status_code == 200:
+                result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            elif response.status_code != 404:
+                result['error'] = True
+            
+        # ===== DRIBBBLE =====
+        elif site_name == 'dribbble':
+            url = "https://dribbble.com/signup/check_email"
+            response = session.post(url, data={'user[email]': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                if 'taken' in response.text.lower() or 'already' in response.text.lower():
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== BEHANCE =====
+        elif site_name == 'behance':
+            url = "https://www.behance.net/v2/account/email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = not data.get('available', True)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+        
+        # ==================== ADDITIONAL PLATFORMS ====================
+        
+        # ===== SLACK =====
+        elif site_name == 'slack':
+            url = "https://slack.com/api/users.admin.checkEmail"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = not data.get('ok', True) or data.get('user_exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== ZOOM =====
+        elif site_name == 'zoom':
+            url = "https://zoom.us/signin"
+            zoom_headers = headers.copy()
+            zoom_headers['Content-Type'] = 'application/x-www-form-urlencoded'
+            response = session.post(url, data={'email': email}, headers=zoom_headers, timeout=8)
+            if response.status_code == 200:
+                if 'password' in response.text.lower() or 'sign in' in response.text.lower():
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== DROPBOX =====
+        elif site_name == 'dropbox':
+            url = "https://www.dropbox.com/login"
+            response = session.post(url, data={'login_email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                if 'password' in response.text.lower() and 'incorrect' not in response.text.lower():
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== REDDIT =====
+        elif site_name == 'reddit':
+            url = "https://www.reddit.com/api/check_email.json"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = not data.get('available', True)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== TIKTOK =====
+        elif site_name == 'tiktok':
+            url = "https://www.tiktok.com/api/user/check_email/"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('is_registered', False) or not data.get('available', True)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== AIRBNB =====
+        elif site_name == 'airbnb':
+            url = "https://www.airbnb.com/api/v2/auth/email_exists"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('email_exists', False) or data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== CANVA =====
+        elif site_name == 'canva':
+            url = "https://www.canva.com/_ajax/api/v2/auth/check_email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('registered', False) or data.get('exists', False)
+                except:
+                    result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                    
+        # ===== BOOKING =====
+        elif site_name == 'booking':
+            url = "https://account.booking.com/api/account/check_email"
+            response = session.post(url, json={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    result['exists'] = data.get('exists', False) or data.get('registered', False)
+                except:
+                    if 'exists' in response.text.lower():
+                        result['exists'] = True
+                    else:
+                        result['error'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+                        
+        # ===== MAILCHIMP =====
+        elif site_name == 'mailchimp':
+            url = "https://login.mailchimp.com/signup/email"
+            response = session.post(url, data={'email': email}, headers=headers, timeout=8)
+            if response.status_code == 200:
+                if 'already' in response.text.lower() or 'exists' in response.text.lower():
+                    result['exists'] = True
+            elif response.status_code == 429:
+                result['rateLimit'] = True
+            else:
+                result['error'] = True
+        
+        # ===== DEFAULT - Mark as unchecked =====
+        else:
+            result['error'] = True
+            result['others'] = {'Message': 'No check method available'}
+            
+    except requests.exceptions.Timeout:
+        result['rateLimit'] = True
+    except requests.exceptions.ConnectionError:
+        result['error'] = True
+    except requests.exceptions.RequestException as e:
+        result['error'] = True
+    except Exception as e:
+        result['error'] = True
+        
+    return result
+
+
+# List of websites to check (100 platforms)
+EMAIL_CHECK_SITES = [
+    # Social Media
+    ('twitter', 'twitter.com'),
+    ('instagram', 'instagram.com'),
+    ('pinterest', 'pinterest.com'),
+    ('tumblr', 'tumblr.com'),
+    ('linkedin', 'linkedin.com'),
+    ('mewe', 'mewe.com'),
+    
+    # Music & Entertainment
+    ('spotify', 'spotify.com'),
+    ('soundcloud', 'soundcloud.com'),
+    ('lastfm', 'last.fm'),
+    ('smule', 'smule.com'),
+    ('twitch', 'twitch.tv'),
+    ('wattpad', 'wattpad.com'),
+    
+    # ==================== CODING & DEVELOPMENT ====================
+    # Version Control & Code Hosting
+    ('github', 'github.com'),
+    ('gitlab', 'gitlab.com'),
+    ('bitbucket', 'bitbucket.org'),
+    ('sourceforge', 'sourceforge.net'),
+    ('launchpad', 'launchpad.net'),
+    ('gitbook', 'gitbook.io'),
+    
+    # Competitive Programming & Learning
+    ('hackerrank', 'hackerrank.com'),
+    ('leetcode', 'leetcode.com'),
+    ('codechef', 'codechef.com'),
+    ('codeforces', 'codeforces.com'),
+    ('topcoder', 'topcoder.com'),
+    ('hackerearth', 'hackerearth.com'),
+    ('codewars', 'codewars.com'),
+    ('exercism', 'exercism.org'),
+    ('freecodecamp', 'freecodecamp.org'),
+    ('kaggle', 'kaggle.com'),
+    ('codecademy', 'codecademy.com'),
+    
+    # Code Playground & IDE
+    ('replit', 'replit.com'),
+    ('codesandbox', 'codesandbox.io'),
+    ('codepen', 'codepen.io'),
+    ('glitch', 'glitch.com'),
+    ('stackoverflow', 'stackoverflow.com'),
+    
+    # Cloud & Deployment
+    ('heroku', 'heroku.com'),
+    ('vercel', 'vercel.com'),
+    ('netlify', 'netlify.com'),
+    ('digitalocean', 'digitalocean.com'),
+    ('render', 'render.com'),
+    ('railway', 'railway.app'),
+    ('supabase', 'supabase.com'),
+    ('firebase', 'firebase.google.com'),
+    
+    # Package Registries
+    ('npm', 'npmjs.com'),
+    ('pypi', 'pypi.org'),
+    ('docker', 'hub.docker.com'),
+    
+    # Developer Tools & Productivity
+    ('jetbrains', 'jetbrains.com'),
+    ('postman', 'postman.com'),
+    ('figma', 'figma.com'),
+    ('notion', 'notion.so'),
+    ('trello', 'trello.com'),
+    
+    # Developer Blogging & Community
+    ('devto', 'dev.to'),
+    ('hashnode', 'hashnode.com'),
+    ('medium', 'medium.com'),
+    
+    # Design & Creative (Dev-Related)
+    ('dribbble', 'dribbble.com'),
+    ('behance', 'behance.net'),
+    
+    # ==================== END CODING PLATFORMS ====================
+    
+    # Professional Platforms
+    ('gravatar', 'gravatar.com'),
+    ('discord', 'discord.com'),
+    ('atlassian', 'atlassian.com'),
+    ('freelancer', 'freelancer.com'),
+    ('envato', 'envato.com'),
+    ('hubspot', 'hubspot.com'),
+    ('xing', 'xing.com'),
+    ('bitly', 'bitly.com'),
+    
+    # Shopping & Services  
+    ('amazon', 'amazon.com'),
+    ('ebay', 'ebay.com'),
+    ('flipkart', 'flipkart.com'),
+    ('lazada', 'lazada.com'),
+    ('tokopedia', 'tokopedia.com'),
+    ('shopify', 'shopify.com'),
+    ('deliveroo', 'deliveroo.com'),
+    
+    # Productivity & Tools
+    ('adobe', 'adobe.com'),
+    ('wordpress', 'wordpress.com'),
+    ('firefox', 'firefox.com'),
+    ('evernote', 'evernote.com'),
+    ('zoho', 'zoho.com'),
+    ('google', 'google.com'),
+    
+    # Community & Social
+    ('quora', 'quora.com'),
+    ('patreon', 'patreon.com'),
+    ('buymeacoffee', 'buymeacoffee.com'),
+    ('bodybuilding', 'bodybuilding.com'),
+    ('picsart', 'picsart.com'),
+    ('reddit', 'reddit.com'),
+    ('tiktok', 'tiktok.com'),
+    
+    # Learning
+    ('duolingo', 'duolingo.com'),
+    
+    # Tech & Gaming
+    ('samsung', 'samsung.com'),
+    ('strava', 'strava.com'),
+    
+    # Finance
+    ('venmo', 'venmo.com'),
+    ('vivino', 'vivino.com'),
+    
+    # Media
+    ('imgur', 'imgur.com'),
+    ('issuu', 'issuu.com'),
+    ('eventbrite', 'eventbrite.com'),
+    ('archiveorg', 'archive.org'),
+    
+    # Communication & Collaboration
+    ('yahoo', 'yahoo.com'),
+    ('slack', 'slack.com'),
+    ('zoom', 'zoom.us'),
+    ('dropbox', 'dropbox.com'),
+    ('mailchimp', 'mailchimp.com'),
+    
+    # Travel & Booking
+    ('airbnb', 'airbnb.com'),
+    ('booking', 'booking.com'),
+    
+    # Design
+    ('canva', 'canva.com'),
+]
+
+
+def run_email_checks_threaded(email: str, sites: list, max_workers: int = 15) -> list:
+    """Run email checks using thread pool for parallel execution."""
+    results = []
+    total = len(sites)
+    completed = 0
+    lock = threading.Lock()
+    
+    def check_and_append(site_tuple):
+        nonlocal completed
+        site_name, domain = site_tuple
+        result = check_email_on_site(site_name, domain, email)
+        with lock:
+            completed += 1
+            print(f"\r {Cy}[{completed}/{total}] Checking {domain}...{' ' * 20}", end='', flush=True)
+        return result
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(check_and_append, site) for site in sites]
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                pass
+                
+    print(f"\r{' ' * 60}\r", end='')
+    return sorted(results, key=lambda x: x['domain'])
+
+
+@is_option
+def email_footprint():
+    """Search for email address footprint across multiple websites."""
+    email = input(f"\n {Wh}Enter email address {Gr}(e.g., user@example.com){Wh}: {Gr}").strip()
+    
+    if not email:
+        print(f"{Re}Error: Please enter an email address.")
+        return
+    
+    # Basic email validation
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if not re.match(email_pattern, email):
+        print(f"{Re}Error: Invalid email format.")
+        return
+    
+    print(f"\n {Wh}{'*' * (len(email) + 6)}")
+    print(f" {Wh}   {Gr}{email}")
+    print(f" {Wh}{'*' * (len(email) + 6)}")
+    
+    # Extract email components
+    local_part, domain = email.split('@')
+    email_hash = hashlib.md5(email.lower().strip().encode()).hexdigest()
+    
+    print(f"\n {Wh}Local Part: {Gr}{local_part}")
+    print(f" {Wh}Domain: {Gr}{domain}")
+    print(f" {Wh}MD5 Hash: {Gr}{email_hash}")
+    
+    start_time = time.time()
+    print(f"\n {Cy}Checking {len(EMAIL_CHECK_SITES)} websites...\n")
+    
+    # Run checks
+    results = run_email_checks_threaded(email, EMAIL_CHECK_SITES, max_workers=10)
+    
+    elapsed_time = round(time.time() - start_time, 2)
+    
+    # Categorize results
+    found = [r for r in results if r['exists'] == True]
+    not_found = [r for r in results if r['exists'] == False and not r['error'] and not r['rateLimit']]
+    rate_limited = [r for r in results if r['rateLimit']]
+    errors = [r for r in results if r['error']]
+    
+    # Print results
+    print(f"\n {Wh}========== {Gr}EMAIL FOOTPRINT RESULTS {Wh}==========")
+    
+    # Show FOUND sites
+    print(f"\n {Gr}[+] EMAIL REGISTERED {Wh}({len(found)} sites):")
+    if found:
+        for r in found:
+            extra = ""
+            if r.get('emailrecovery'):
+                extra += f" | Recovery: {r['emailrecovery']}"
+            if r.get('phoneNumber'):
+                extra += f" | Phone: {r['phoneNumber']}"
+            if r.get('others'):
+                for k, v in r['others'].items():
+                    if v:
+                        extra += f" | {k}: {v}"
+            print(f" {Wh}[ {Gr}+ {Wh}] {r['domain']}{Gr}{extra}")
+    else:
+        print(f" {Ye}   No registered accounts found")
+    
+    # Show NOT FOUND sites
+    print(f"\n {Mage}[-] NOT REGISTERED {Wh}({len(not_found)} sites):")
+    if not_found:
+        not_found_domains = [r['domain'] for r in not_found]
+        # Print in columns
+        for i in range(0, len(not_found_domains), 3):
+            row = not_found_domains[i:i+3]
+            print(f" {Wh}[ {Mage}- {Wh}] " + ", ".join(row))
+    else:
+        print(f" {Ye}   All sites either found, rate-limited, or errored")
+    
+    # Show RATE LIMITED sites
+    if rate_limited:
+        print(f"\n {Ye}[x] RATE LIMITED {Wh}({len(rate_limited)} sites):")
+        rate_limited_domains = [r['domain'] for r in rate_limited]
+        for i in range(0, len(rate_limited_domains), 3):
+            row = rate_limited_domains[i:i+3]
+            print(f" {Wh}[ {Ye}x {Wh}] " + ", ".join(row))
+    
+    # Show ERROR sites
+    if errors:
+        print(f"\n {Re}[!] CHECK FAILED {Wh}({len(errors)} sites):")
+        error_domains = [r['domain'] for r in errors]
+        for i in range(0, len(error_domains), 3):
+            row = error_domains[i:i+3]
+            print(f" {Wh}[ {Re}! {Wh}] " + ", ".join(row))
+    
+    # Check breach databases
+    print(f"\n {Cy}[*] Checking breach databases...")
+    try:
+        hibp_url = f"https://haveibeenpwned.com/unifiedsearch/{email}"
+        response = requests.get(hibp_url, timeout=10, headers={
+            'User-Agent': get_random_useragent(),
+            'Accept': 'application/json'
+        })
+        if response.status_code == 200:
+            breach_data = response.json()
+            if breach_data.get('Breaches'):
+                breaches = breach_data['Breaches']
+                print(f"\n {Re}[⚠ SECURITY ALERT] {Wh}Found in {len(breaches)} data breach(es):")
+                for breach in breaches[:10]:
+                    print(f" {Wh}[ {Re}! {Wh}] {breach.get('Name', 'Unknown')}")
+                if len(breaches) > 10:
+                    print(f" {Wh}   ... and {len(breaches) - 10} more")
+            else:
+                print(f" {Wh}[ {Gr}✓ {Wh}] No breaches found (good!)")
+        elif response.status_code == 404:
+            print(f" {Wh}[ {Gr}✓ {Wh}] No breaches found (good!)")
+        else:
+            print(f" {Wh}[ {Ye}? {Wh}] Could not check (status: {response.status_code})")
+    except Exception as e:
+        print(f" {Wh}[ {Ye}? {Wh}] Could not check breach database")
+    
+    # Summary
+    print(f"\n {Wh}{'─' * 55}")
+    print(f" {Wh}Summary: {Gr}{len(found)} found{Wh}, {Mage}{len(not_found)} not found{Wh}, {Ye}{len(rate_limited)} rate-limited{Wh}, {Re}{len(errors)} errors")
+    print(f" {Wh}Checked {len(EMAIL_CHECK_SITES)} websites in {Gr}{elapsed_time}{Wh} seconds")
+    print(f" {Wh}{'─' * 55}")
+
+
+@is_option
+def phone_footprint():
+    """Search for phone number footprint across various services."""
+    phone_input = input(
+        f"\n {Wh}Enter phone number {Gr}Ex [+6281xxxxxxxxx] {Wh}: {Gr}").strip()
+    
+    if not phone_input:
+        print(f"{Re}Error: Please enter a phone number.")
+        return
+    
+    default_region = "ID"
+    
+    try:
+        parsed_number = phonenumbers.parse(phone_input, default_region)
+        
+        if not phonenumbers.is_valid_number(parsed_number):
+            print(f"{Ye}Warning: This may not be a valid phone number.")
+        
+        # Get phone info
+        region_code = phonenumbers.region_code_for_number(parsed_number)
+        phone_carrier = carrier.name_for_number(parsed_number, "en")
+        location = geocoder.description_for_number(parsed_number, "en")
+        phone_type = phonenumbers.number_type(parsed_number)
+        e164_format = phonenumbers.format_number(parsed_number, phonenumbers.PhoneNumberFormat.E164)
+        national_format = phonenumbers.format_number(parsed_number, phonenumbers.PhoneNumberFormat.NATIONAL)
+        
+        results = {'found': [], 'messaging_apps': [], 'info': {}}
+        
+        print(f"\n {Wh}========== {Gr}PHONE NUMBER FOOTPRINT {Wh}==========")
+        print(f"\n {Wh}Target Number: {Gr}{e164_format}")
+        print(f" {Wh}National Format: {Gr}{national_format}")
+        print(f" {Wh}Country/Region: {Gr}{location or region_code or 'Unknown'}")
+        print(f" {Wh}Carrier: {Gr}{phone_carrier or 'Unknown'}")
+        
+        # Determine phone type
+        type_map = {
+            phonenumbers.PhoneNumberType.MOBILE: "Mobile",
+            phonenumbers.PhoneNumberType.FIXED_LINE: "Fixed-line",
+            phonenumbers.PhoneNumberType.FIXED_LINE_OR_MOBILE: "Fixed-line/Mobile",
+            phonenumbers.PhoneNumberType.TOLL_FREE: "Toll-free",
+            phonenumbers.PhoneNumberType.VOIP: "VoIP",
+        }
+        phone_type_str = type_map.get(phone_type, "Unknown")
+        print(f" {Wh}Type: {Gr}{phone_type_str}")
+        
+        loading_animation("Searching for phone footprint", 1.5)
+        
+        # Services commonly associated with phone numbers
+        messaging_services = [
+            {"name": "WhatsApp", "url": f"https://wa.me/{e164_format.replace('+', '')}", "check": "whatsapp"},
+            {"name": "Telegram", "url": f"https://t.me/+{e164_format.replace('+', '')}", "check": "telegram"},
+            {"name": "Viber", "url": "https://www.viber.com/", "check": "viber"},
+            {"name": "Signal", "url": "https://signal.org/", "check": "signal"},
+            {"name": "WeChat", "url": "https://www.wechat.com/", "check": "wechat"},
+            {"name": "LINE", "url": "https://line.me/", "check": "line"},
+        ]
+        
+        social_services = [
+            {"name": "Facebook", "url": "https://www.facebook.com/"},
+            {"name": "Instagram", "url": "https://www.instagram.com/"},
+            {"name": "Twitter/X", "url": "https://twitter.com/"},
+            {"name": "LinkedIn", "url": "https://www.linkedin.com/"},
+            {"name": "TikTok", "url": "https://www.tiktok.com/"},
+            {"name": "Snapchat", "url": "https://www.snapchat.com/"},
+        ]
+        
+        other_services = [
+            {"name": "Google", "url": "https://accounts.google.com/"},
+            {"name": "Apple", "url": "https://appleid.apple.com/"},
+            {"name": "Microsoft", "url": "https://account.microsoft.com/"},
+            {"name": "Amazon", "url": "https://www.amazon.com/"},
+            {"name": "PayPal", "url": "https://www.paypal.com/"},
+            {"name": "Uber", "url": "https://www.uber.com/"},
+            {"name": "Grab", "url": "https://www.grab.com/"},
+            {"name": "Gojek", "url": "https://www.gojek.com/"},
+        ]
+        
+        # Check WhatsApp (can be partially verified)
+        print(f"\n {Cy}[1] Checking messaging apps...")
+        print(f" {Wh}[ {Gr}→ {Wh}] WhatsApp: {Gr}https://wa.me/{e164_format.replace('+', '')}")
+        print(f" {Wh}     {Ye}(Click link to check if registered)")
+        results['messaging_apps'].append({
+            'name': 'WhatsApp',
+            'url': f"https://wa.me/{e164_format.replace('+', '')}",
+            'status': 'Check manually'
+        })
+        
+        print(f" {Wh}[ {Gr}→ {Wh}] Telegram: {Gr}https://t.me/+{e164_format.replace('+', '')}")
+        results['messaging_apps'].append({
+            'name': 'Telegram',
+            'url': f"https://t.me/+{e164_format.replace('+', '')}",
+            'status': 'Check manually'
+        })
+        
+        # Check Truecaller-like services (using available APIs)
+        print(f"\n {Cy}[2] Checking caller ID services...")
+        
+        # NumVerify API (free tier)
+        try:
+            clean_number = e164_format.replace('+', '')
+            numverify_url = f"http://apilayer.net/api/validate?access_key=YOUR_API_KEY&number={clean_number}"
+            # Note: This would need a real API key to work
+            print(f" {Wh}[ {Ye}? {Wh}] NumVerify: API key required for lookup")
+        except:
+            pass
+        
+        # Search for potential social media profiles
+        print(f"\n {Cy}[3] Potential social media associations...")
+        print(f" {Wh}The following services commonly use phone numbers for registration:")
+        
+        for service in social_services:
+            print(f" {Wh}[ {Cy}? {Wh}] {service['name']}: {Ye}May be registered")
+        
+        print(f"\n {Cy}[4] Other services...")
+        for service in other_services:
+            print(f" {Wh}[ {Cy}? {Wh}] {service['name']}: {Ye}May be registered")
+        
+        # Generate search queries
+        print(f"\n {Cy}[5] Search suggestions...")
+        search_queries = [
+            f'"{e164_format}"',
+            f'"{national_format}"',
+            f'"{phone_input}"',
+        ]
+        
+        print(f" {Wh}Try these Google dorks to find more info:")
+        for query in search_queries:
+            encoded_query = query.replace('"', '%22').replace(' ', '+')
+            print(f" {Wh}[ {Gr}→ {Wh}] https://www.google.com/search?q={encoded_query}")
+        
+        # Summary
+        print(f"\n {Wh}{'─' * 50}")
+        print(f"\n {Gr}[SUMMARY] {Wh}Phone Number Analysis:")
+        print(f" {Wh}• Number: {Gr}{e164_format}")
+        print(f" {Wh}• Location: {Gr}{location or 'Unknown'}")
+        print(f" {Wh}• Carrier: {Gr}{phone_carrier or 'Unknown'}")
+        print(f" {Wh}• Type: {Gr}{phone_type_str}")
+        
+        print(f"\n {Wh}[MESSAGING APPS]")
+        for app in results['messaging_apps']:
+            print(f" {Wh}• {app['name']}: {Gr}{app['url']}")
+        
+        print(f"\n {Wh}{'─' * 50}")
+        print(f" {Ye}Note: Most services require manual verification.")
+        print(f" {Ye}Phone number lookups are limited without paid APIs.")
+        print(f" {Ye}For detailed caller ID info, consider Truecaller or similar services.")
+        
+    except phonenumbers.phonenumberutil.NumberParseException as e:
+        print(f"{Re}Error parsing phone number: {e}")
+    except Exception as e:
+        print(f"{Re}Error: {e}")
+
+
 @is_option
 def TrackLu():
     """Search for username across multiple social media platforms."""
@@ -441,6 +2441,30 @@ def TrackLu():
             {"url": "https://weheartit.com/{}", "name": "We Heart It"},
             {"url": "https://open.spotify.com/user/{}", "name": "Spotify"},
             {"url": "https://mastodon.social/@{}", "name": "Mastodon"},
+
+            {"url": "https://www.deviantart.com/{}", "name": "DeviantArt"},
+            {"url": "https://www.goodreads.com/{}", "name": "Goodreads"},
+            {"url": "https://www.vimeo.com/{}", "name": "Vimeo"},
+            {"url": "https://www.badoo.com/{}", "name": "Badoo"},
+            {"url": "https://www.myspace.com/{}", "name": "MySpace"},
+            {"url": "https://www.classmates.com/people/{}", "name": "Classmates"},
+            {"url": "https://www.yelp.com/user_details?userid={}", "name": "Yelp"},
+            {"url": "https://www.last.fm/user/{}", "name": "Last.fm"},
+            {"url": "https://www.mixcloud.com/{}", "name": "Mixcloud"},
+            {"url": "https://www.taringa.net/{}", "name": "Taringa"},
+            {"url": "https://www.xing.com/profile/{}", "name": "Xing"},
+            {"url": "https://www.tripadvisor.com/members/{}", "name": "TripAdvisor"},
+            {"url": "https://www.bandcamp.com/{}", "name": "Bandcamp"},
+            {"url": "https://www.codementor.io/{}", "name": "Codementor"},
+            {"url": "https://www.producthunt.com/@{}", "name": "Product Hunt"},
+            {"url": "https://www.behance.net/{}", "name": "Behance"},
+            {"url": "https://www.patreon.com/{}", "name": "Patreon"},
+            {"url": "https://www.ello.co/{}", "name": "Ello"},
+            {"url": "https://www.soundcloud.com/{}", "name": "SoundCloud"},
+            {"url": "https://www.whatsapp.com/{}", "name": "WhatsApp"},
+            {"url": "https://www.signal.org/{}", "name": "Signal"},
+
+
         ]
         
         total = len(social_media)
@@ -890,6 +2914,1342 @@ def hash_generator():
 
 
 @is_option
+def network_scanner():
+    """Scan local network to discover connected devices."""
+    import subprocess
+    import struct
+    
+    print(f"\n {Wh}========== {Gr}LOCAL NETWORK SCANNER {Wh}==========")
+    
+    def get_local_ip():
+        """Get the local IP address of this machine."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            return local_ip
+        except:
+            return None
+    
+    def get_network_range(ip):
+        """Get the network range (assuming /24 subnet)."""
+        parts = ip.split('.')
+        return f"{parts[0]}.{parts[1]}.{parts[2]}"
+    
+    def get_mac_address(ip):
+        """Get MAC address from ARP table."""
+        try:
+            # Try to get MAC from ARP table
+            result = subprocess.run(['arp', '-n', ip], capture_output=True, text=True, timeout=2)
+            output = result.stdout
+            # Parse MAC address from output
+            for line in output.split('\n'):
+                if ip in line:
+                    parts = line.split()
+                    for part in parts:
+                        if ':' in part and len(part) == 17:
+                            return part.upper()
+                        # Handle format like aa:bb:cc:dd:ee:ff
+                        if re.match(r'^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$', part):
+                            return part.upper()
+        except:
+            pass
+        return "Unknown"
+    
+    def get_hostname(ip):
+        """Try to resolve hostname for an IP using multiple methods."""
+        hostname = None
+        
+        # Method 1: Standard reverse DNS lookup
+        try:
+            hostname = socket.gethostbyaddr(ip)[0]
+            if hostname and hostname != ip:
+                return hostname
+        except:
+            pass
+        
+        # Method 2: Try NetBIOS name lookup (for Windows devices)
+        try:
+            result = subprocess.run(
+                ['nmblookup', '-A', ip],
+                capture_output=True, text=True, timeout=3
+            )
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    line = line.strip()
+                    if '<00>' in line and 'GROUP' not in line:
+                        # Extract NetBIOS name
+                        name = line.split()[0]
+                        if name and not name.startswith('Looking'):
+                            return name
+        except:
+            pass
+        
+        # Method 3: Try mDNS/Avahi lookup (for Linux/Mac devices)
+        try:
+            result = subprocess.run(
+                ['avahi-resolve', '-a', ip],
+                capture_output=True, text=True, timeout=3
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                parts = result.stdout.strip().split()
+                if len(parts) >= 2:
+                    hostname = parts[1].rstrip('.')
+                    if hostname:
+                        return hostname
+        except:
+            pass
+        
+        # Method 4: Try getent hosts
+        try:
+            result = subprocess.run(
+                ['getent', 'hosts', ip],
+                capture_output=True, text=True, timeout=2
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                parts = result.stdout.strip().split()
+                if len(parts) >= 2:
+                    return parts[1]
+        except:
+            pass
+        
+        # Method 5: Check /etc/hosts file
+        try:
+            with open('/etc/hosts', 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[0] == ip:
+                            return parts[1]
+        except:
+            pass
+        
+        # Method 6: Parse arp -a output for hostname
+        try:
+            result = subprocess.run(['arp', '-a'], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if ip in line:
+                        # Format: hostname (ip) at mac ...
+                        # or: ? (ip) at mac ...
+                        match = re.match(r'^(\S+)\s+\(' + re.escape(ip) + r'\)', line)
+                        if match:
+                            name = match.group(1)
+                            if name and name != '?':
+                                return name
+        except:
+            pass
+        
+        # Method 7: Try 'host' command for reverse DNS
+        try:
+            result = subprocess.run(['host', ip], capture_output=True, text=True, timeout=3)
+            if result.returncode == 0 and 'domain name pointer' in result.stdout:
+                # Format: X.X.X.X.in-addr.arpa domain name pointer hostname.
+                parts = result.stdout.strip().split('domain name pointer')
+                if len(parts) >= 2:
+                    hostname = parts[1].strip().rstrip('.')
+                    if hostname:
+                        return hostname
+        except:
+            pass
+        
+        # Method 8: Try nmap for hostname detection (more thorough)
+        try:
+            result = subprocess.run(
+                ['nmap', '-sn', '-R', ip],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'Nmap scan report for' in line:
+                        # Format: Nmap scan report for hostname (ip)
+                        # or: Nmap scan report for ip
+                        match = re.search(r'Nmap scan report for (.+?) \(' + re.escape(ip) + r'\)', line)
+                        if match:
+                            return match.group(1)
+                        # Check if it found a hostname via PTR
+                        match = re.search(r'Nmap scan report for (\S+)', line)
+                        if match and match.group(1) != ip:
+                            return match.group(1)
+        except:
+            pass
+        
+        return "Unknown"
+    
+    def get_hostname_from_arp():
+        """Get all hostnames from arp -a output at once."""
+        hostnames = {}
+        try:
+            result = subprocess.run(['arp', '-a'], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    # Format: hostname (ip) at mac ...
+                    match = re.match(r'^(\S+)\s+\(([0-9.]+)\)', line)
+                    if match:
+                        name, ip = match.groups()
+                        if name and name != '?':
+                            hostnames[ip] = name
+        except:
+            pass
+        return hostnames
+    
+    def get_vendor_from_mac(mac):
+        """Get vendor name from MAC address (first 3 octets)."""
+        # Common MAC vendor prefixes
+        vendors = {
+            '00:50:56': 'VMware',
+            '00:0C:29': 'VMware',
+            '00:1C:42': 'Parallels',
+            '08:00:27': 'VirtualBox',
+            '52:54:00': 'QEMU/KVM',
+            'B8:27:EB': 'Raspberry Pi',
+            'DC:A6:32': 'Raspberry Pi',
+            'E4:5F:01': 'Raspberry Pi',
+            '00:1A:11': 'Google',
+            '94:EB:2C': 'Google',
+            '3C:5A:B4': 'Google',
+            'F4:F5:D8': 'Google',
+            '00:17:88': 'Philips Hue',
+            '00:1E:C2': 'Apple',
+            '00:03:93': 'Apple',
+            '00:0A:95': 'Apple',
+            '00:1D:4F': 'Apple',
+            'A4:83:E7': 'Apple',
+            'AC:BC:32': 'Apple',
+            '3C:06:30': 'Apple',
+            '78:31:C1': 'Apple',
+            'F0:18:98': 'Apple',
+            '00:26:BB': 'Apple',
+            '40:6C:8F': 'Apple',
+            'D0:E1:40': 'Apple',
+            '00:26:B0': 'Apple',
+            '00:23:12': 'Apple',
+            '18:AF:8F': 'Apple',
+            '00:24:36': 'Apple',
+            'A8:20:66': 'Apple',
+            '00:1F:F3': 'Apple',
+            '00:21:E9': 'Apple',
+            'B8:C7:5D': 'Apple',
+            '00:25:00': 'Apple',
+            '58:B0:35': 'Apple',
+            '60:C5:47': 'Apple',
+            '88:66:A5': 'Apple',
+            '28:CF:DA': 'Apple',
+            '00:50:F2': 'Microsoft',
+            '00:03:FF': 'Microsoft',
+            '00:0D:3A': 'Microsoft',
+            '00:12:5A': 'Microsoft',
+            '00:15:5D': 'Microsoft',
+            '00:17:FA': 'Microsoft',
+            '00:1D:D8': 'Microsoft',
+            '28:18:78': 'Microsoft',
+            '00:22:48': 'Microsoft',
+            '00:25:AE': 'Microsoft',
+            '60:45:BD': 'Microsoft',
+            '7C:1E:52': 'Microsoft',
+            'B4:0E:DE': 'Samsung',
+            '00:26:37': 'Samsung',
+            '5C:0A:5B': 'Samsung',
+            '84:11:9E': 'Samsung',
+            '94:35:0A': 'Samsung',
+            'AC:5F:3E': 'Samsung',
+            'C4:73:1E': 'Samsung',
+            'F0:25:B7': 'Samsung',
+            '00:E0:4C': 'Realtek',
+            '00:60:52': 'Realtek',
+            '52:54:00': 'Realtek',
+            '00:1B:21': 'Intel',
+            '00:1C:C0': 'Intel',
+            '00:1D:E0': 'Intel',
+            '00:1E:64': 'Intel',
+            '00:1E:67': 'Intel',
+            '00:1F:3B': 'Intel',
+            '00:1F:3C': 'Intel',
+            '00:21:5C': 'Intel',
+            '00:21:6A': 'Intel',
+            '00:22:FA': 'Intel',
+            '00:24:D6': 'Intel',
+            '00:24:D7': 'Intel',
+            '00:26:C6': 'Intel',
+            '00:26:C7': 'Intel',
+            '3C:97:0E': 'Intel',
+            '4C:79:6E': 'Intel',
+            '84:3A:4B': 'Intel',
+            'A4:4C:C8': 'Intel',
+            'E8:B1:FC': 'Intel',
+            'F8:16:54': 'Intel',
+            '00:0E:C6': 'ASUS',
+            '00:11:2F': 'ASUS',
+            '00:15:F2': 'ASUS',
+            '00:17:31': 'ASUS',
+            '00:1A:92': 'ASUS',
+            '00:1D:60': 'ASUS',
+            '00:1E:8C': 'ASUS',
+            '00:22:15': 'ASUS',
+            '00:23:54': 'ASUS',
+            '00:24:8C': 'ASUS',
+            '00:26:18': 'ASUS',
+            '14:DA:E9': 'ASUS',
+            '1C:B7:2C': 'ASUS',
+            '2C:56:DC': 'ASUS',
+            '30:85:A9': 'ASUS',
+            '54:04:A6': 'ASUS',
+            '60:45:CB': 'ASUS',
+            'AC:22:0B': 'ASUS',
+            'BC:EE:7B': 'ASUS',
+            'D8:50:E6': 'ASUS',
+            'F4:6D:04': 'ASUS',
+            '00:09:0F': 'Fortinet',
+            '00:1B:77': 'Intel',
+            'B0:BE:76': 'TP-Link',
+            '50:C7:BF': 'TP-Link',
+            '60:E3:27': 'TP-Link',
+            '94:D9:B3': 'TP-Link',
+            'C0:25:E9': 'TP-Link',
+            'E8:DE:27': 'TP-Link',
+            'F8:1A:67': 'TP-Link',
+            '14:CC:20': 'TP-Link',
+            '30:B5:C2': 'TP-Link',
+            '54:C8:0F': 'TP-Link',
+            '64:66:B3': 'TP-Link',
+            '00:18:E7': 'D-Link',
+            '00:1B:11': 'D-Link',
+            '00:1C:F0': 'D-Link',
+            '00:1E:58': 'D-Link',
+            '00:21:91': 'D-Link',
+            '00:22:B0': 'D-Link',
+            '00:24:01': 'D-Link',
+            '00:26:5A': 'D-Link',
+            '1C:7E:E5': 'D-Link',
+            '28:10:7B': 'D-Link',
+            '34:08:04': 'D-Link',
+            '1C:AF:F7': 'D-Link',
+            '78:54:2E': 'D-Link',
+            '9C:D6:43': 'D-Link',
+            'AC:F1:DF': 'D-Link',
+            'C8:BE:19': 'D-Link',
+            'F0:7D:68': 'D-Link',
+            '00:14:BF': 'Linksys',
+            '00:18:39': 'Linksys',
+            '00:1A:70': 'Linksys',
+            '00:1C:10': 'Linksys',
+            '00:1D:7E': 'Linksys',
+            '00:1E:E5': 'Linksys',
+            '00:21:29': 'Linksys',
+            '00:22:6B': 'Linksys',
+            '00:23:69': 'Linksys',
+            '00:25:9C': 'Linksys',
+            '58:6D:8F': 'Linksys',
+            '68:7F:74': 'Linksys',
+            'C0:C1:C0': 'Linksys',
+            '20:AA:4B': 'Linksys',
+            'E8:9F:80': 'Linksys',
+            '00:1D:0F': 'TP-Link',
+            '00:27:19': 'TP-Link',
+            '10:FE:ED': 'TP-Link',
+            '18:A6:F7': 'TP-Link',
+            '20:DC:E6': 'TP-Link',
+            '24:69:68': 'TP-Link',
+            '00:01:E6': 'Hewlett-Packard',
+            '00:02:A5': 'Hewlett-Packard',
+            '00:04:EA': 'Hewlett-Packard',
+            '00:08:02': 'Hewlett-Packard',
+            '00:0B:CD': 'Hewlett-Packard',
+            '00:0D:9D': 'Hewlett-Packard',
+            '00:0E:7F': 'Hewlett-Packard',
+            '00:0F:20': 'Hewlett-Packard',
+            '00:0F:61': 'Hewlett-Packard',
+            '00:10:83': 'Hewlett-Packard',
+            '00:11:0A': 'Hewlett-Packard',
+            '00:11:85': 'Hewlett-Packard',
+            '00:12:79': 'Hewlett-Packard',
+            '00:13:21': 'Hewlett-Packard',
+            '00:14:38': 'Hewlett-Packard',
+            '00:14:C2': 'Hewlett-Packard',
+            '00:15:60': 'Hewlett-Packard',
+            '00:16:35': 'Hewlett-Packard',
+            '00:17:08': 'Hewlett-Packard',
+            '00:17:A4': 'Hewlett-Packard',
+            '00:18:71': 'Hewlett-Packard',
+            '00:18:FE': 'Hewlett-Packard',
+            '00:19:BB': 'Hewlett-Packard',
+            '00:1A:4B': 'Hewlett-Packard',
+            '00:1B:78': 'Hewlett-Packard',
+            '00:1C:2E': 'Hewlett-Packard',
+            '00:1E:0B': 'Hewlett-Packard',
+            '00:1F:29': 'Hewlett-Packard',
+            '00:21:5A': 'Hewlett-Packard',
+            '00:22:64': 'Hewlett-Packard',
+            '00:23:7D': 'Hewlett-Packard',
+            '00:24:81': 'Hewlett-Packard',
+            '00:25:B3': 'Hewlett-Packard',
+            '00:26:55': 'Hewlett-Packard',
+            '00:30:6E': 'Hewlett-Packard',
+            '00:60:B0': 'Hewlett-Packard',
+            '00:80:A0': 'Hewlett-Packard',
+            '08:00:09': 'Hewlett-Packard',
+        }
+        
+        if mac == "Unknown":
+            return "Unknown"
+        
+        mac_prefix = mac[:8].upper()
+        
+        # Check for locally administered MAC (randomized/private MAC)
+        # Second character: 2, 6, A, E indicate locally administered
+        if len(mac) >= 2:
+            second_char = mac[1].upper()
+            if second_char in ['2', '6', 'A', 'E']:
+                return "Private MAC"
+        
+        return vendors.get(mac_prefix, "Unknown Vendor")
+    
+    def is_private_mac(mac):
+        """Check if MAC address is locally administered (randomized)."""
+        if mac == "Unknown" or len(mac) < 2:
+            return False
+        second_char = mac[1].upper()
+        return second_char in ['2', '6', 'A', 'E']
+    
+    def ping_host(ip, timeout=1):
+        """Check if a host is alive using ping."""
+        try:
+            # Use ping command based on OS
+            if os.name == 'nt':
+                cmd = ['ping', '-n', '1', '-w', str(timeout * 1000), ip]
+            else:
+                cmd = ['ping', '-c', '1', '-W', str(timeout), ip]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 1)
+            return result.returncode == 0
+        except:
+            return False
+    
+    def scan_host_socket(ip, timeout=0.5):
+        """Try to connect to common ports to detect if host is alive."""
+        common_ports = [80, 443, 22, 445, 139, 21, 23, 8080, 3389]
+        for port in common_ports:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                result = sock.connect_ex((ip, port))
+                sock.close()
+                if result == 0:
+                    return True
+            except:
+                pass
+        return False
+    
+    # Get local IP
+    local_ip = get_local_ip()
+    if not local_ip:
+        print(f"{Re}Error: Could not determine local IP address.")
+        return
+    
+    network_range = get_network_range(local_ip)
+    
+    print(f"\n {Wh}Your IP: {Gr}{local_ip}")
+    print(f" {Wh}Network: {Gr}{network_range}.0/24")
+    print(f"\n {Cy}Scanning network for connected devices...{Wh}")
+    print(f" {Wh}This may take a minute...\n")
+    
+    # Helper function to get hosts from ARP cache
+    def get_arp_cache_hosts():
+        """Get all hosts currently in the ARP cache."""
+        hosts = set()
+        try:
+            # Try arp -a first
+            result = subprocess.run(['arp', '-a'], capture_output=True, text=True, timeout=3)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    # Match IP addresses in parentheses: (192.168.1.x)
+                    match = re.search(r'\((\d+\.\d+\.\d+\.\d+)\)', line)
+                    if match:
+                        ip = match.group(1)
+                        if ip.startswith(network_range + '.'):
+                            # Check if it has a valid MAC (not incomplete)
+                            if 'incomplete' not in line.lower() and '<incomplete>' not in line.lower():
+                                hosts.add(ip)
+        except:
+            pass
+        
+        try:
+            # Also try arp -n format
+            result = subprocess.run(['arp', '-n'], capture_output=True, text=True, timeout=3)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        ip = parts[0]
+                        if re.match(r'^\d+\.\d+\.\d+\.\d+$', ip) and ip.startswith(network_range + '.'):
+                            # Check if it has a valid MAC (not incomplete)
+                            if 'incomplete' not in line.lower():
+                                hosts.add(ip)
+        except:
+            pass
+        
+        try:
+            # Try reading /proc/net/arp on Linux
+            if os.path.exists('/proc/net/arp'):
+                with open('/proc/net/arp', 'r') as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) >= 4 and parts[0] != 'IP':
+                            ip = parts[0]
+                            flags = parts[2]
+                            if ip.startswith(network_range + '.') and flags != '0x0':
+                                hosts.add(ip)
+        except:
+            pass
+        
+        return hosts
+    
+    # Helper function to use arping (more reliable than ping for some devices)
+    def arping_host(ip, timeout=1):
+        """Use arping to check if host is alive (bypasses firewall better)."""
+        try:
+            # arping sends ARP requests directly - works even if ICMP is blocked
+            result = subprocess.run(
+                ['arping', '-c', '1', '-w', str(timeout), ip],
+                capture_output=True, text=True, timeout=timeout + 2
+            )
+            return result.returncode == 0 or 'reply from' in result.stdout.lower()
+        except:
+            return False
+    
+    # Helper function to use nmap for host discovery (if available)
+    def nmap_discover():
+        """Use nmap for ARP discovery (most reliable method)."""
+        hosts = set()
+        try:
+            # nmap -sn uses ARP ping on local network which is very reliable
+            result = subprocess.run(
+                ['nmap', '-sn', '-PR', f'{network_range}.0/24'],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    match = re.search(r'Nmap scan report for.*?(\d+\.\d+\.\d+\.\d+)', line)
+                    if match:
+                        hosts.add(match.group(1))
+        except:
+            pass
+        return hosts
+    
+    # First, try to populate ARP table using multiple methods
+    print(f" {Cy}Phase 1: Populating ARP cache...{Wh}")
+    
+    try:
+        # Send ping to broadcast address to populate ARP table
+        broadcast_ip = f"{network_range}.255"
+        if os.name != 'nt':
+            subprocess.run(['ping', '-c', '2', '-b', broadcast_ip], capture_output=True, timeout=3)
+    except:
+        pass
+    
+    # Try sending ARP requests using arping to broadcast (if available)
+    try:
+        subprocess.run(['arping', '-c', '1', '-b', '-f', f'{network_range}.255'], capture_output=True, timeout=3)
+    except:
+        pass
+    
+    # Try using ip neigh to get neighbors
+    try:
+        result = subprocess.run(['ip', 'neigh', 'show'], capture_output=True, text=True, timeout=3)
+    except:
+        pass
+    
+    discovered_hosts = set()
+    
+    # Phase 1: Get hosts already in ARP cache (these are definitely alive)
+    arp_hosts = get_arp_cache_hosts()
+    discovered_hosts.update(arp_hosts)
+    if arp_hosts:
+        print(f" {Gr}Found {len(arp_hosts)} device(s) in ARP cache{Wh}")
+    
+    # Phase 2: Try nmap if available (most reliable)
+    print(f" {Cy}Phase 2: Scanning network...{Wh}")
+    nmap_hosts = nmap_discover()
+    if nmap_hosts:
+        new_hosts = nmap_hosts - discovered_hosts
+        discovered_hosts.update(nmap_hosts)
+        if new_hosts:
+            print(f" {Gr}nmap discovered {len(new_hosts)} additional device(s){Wh}")
+    
+    # Scan the network range
+    def scan_ip(i):
+        ip = f"{network_range}.{i}"
+        # Skip if already discovered
+        if ip in discovered_hosts:
+            return None
+        # Try multiple methods
+        if ping_host(ip, timeout=1):
+            return ip
+        if arping_host(ip, timeout=1):
+            return ip
+        if scan_host_socket(ip, timeout=0.3):
+            return ip
+        return None
+    
+    # Use threading for faster scanning (for IPs not yet discovered)
+    print(f"\n {Cy}Phase 3: Ping/Port scanning remaining IPs...{Wh}\n")
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        futures = {executor.submit(scan_ip, i): i for i in range(1, 255)}
+        completed = 0
+        for future in as_completed(futures):
+            completed += 1
+            progress_bar(completed, 254, prefix="Scanning: ")
+            result = future.result()
+            if result:
+                discovered_hosts.add(result)
+    
+    print()  # New line after progress bar
+    
+    # Check ARP cache one more time after all the scanning
+    final_arp_hosts = get_arp_cache_hosts()
+    new_from_arp = final_arp_hosts - discovered_hosts
+    if new_from_arp:
+        print(f" {Gr}Found {len(new_from_arp)} additional device(s) in ARP cache after scan{Wh}")
+        discovered_hosts.update(final_arp_hosts)
+    
+    # Convert to sorted list
+    discovered_hosts = sorted(list(discovered_hosts), key=lambda x: [int(p) for p in x.split('.')])
+    
+    if not discovered_hosts:
+        print(f"\n {Ye}No devices found on the network.")
+        print(f" {Wh}Try running with sudo/admin privileges for better results.")
+        print(f" {Wh}Installing 'nmap' and 'arping' can improve detection.")
+        return
+    
+    # Pre-fetch hostnames from ARP table
+    arp_hostnames = get_hostname_from_arp()
+    
+    # Display results
+    print(f"\n {Gr}Found {len(discovered_hosts)} device(s) on the network:{Wh}\n")
+    print(f" {Cy}{'─' * 95}{Wh}")
+    print(f" {Wh}│ {'No.':<4} │ {'IP Address':<16} │ {'MAC Address':<18} │ {'Hostname':<20} │ {'Vendor/Type':<18} │{Wh}")
+    print(f" {Cy}{'─' * 95}{Wh}")
+    
+    private_mac_devices = []
+    
+    for idx, ip in enumerate(discovered_hosts, 1):
+        mac = get_mac_address(ip)
+        
+        # Try ARP hostname first, then full lookup
+        hostname = arp_hostnames.get(ip) or get_hostname(ip)
+        vendor = get_vendor_from_mac(mac)
+        
+        # Track private MAC devices
+        if is_private_mac(mac):
+            private_mac_devices.append(ip)
+            if hostname == "Unknown":
+                hostname = "Phone/Tablet?"
+        
+        # Truncate long values
+        if len(hostname) > 20:
+            hostname = hostname[:17] + "..."
+        if len(vendor) > 18:
+            vendor = vendor[:15] + "..."
+        
+        # Highlight local machine
+        if ip == local_ip:
+            print(f" {Gr}│ {idx:<4} │ {ip:<16} │ {mac:<18} │ {hostname:<20} │ {vendor:<18} │ ← You{Wh}")
+        elif is_private_mac(mac):
+            print(f" {Wh}│ {idx:<4} │ {Gr}{ip:<16}{Wh} │ {Ye}{mac:<18}{Wh} │ {Ye}{hostname:<20}{Wh} │ {Ye}{vendor:<18}{Wh} │{Wh}")
+        else:
+            print(f" {Wh}│ {idx:<4} │ {Gr}{ip:<16}{Wh} │ {Cy}{mac:<18}{Wh} │ {Cy}{hostname:<20}{Wh} │ {Mage}{vendor:<18}{Wh} │{Wh}")
+    
+    print(f" {Cy}{'─' * 95}{Wh}")
+    
+    # Summary
+    print(f"\n {Wh}Summary:")
+    print(f" {Wh}├─ Total devices: {Gr}{len(discovered_hosts)}{Wh}")
+    print(f" {Wh}├─ Network: {Gr}{network_range}.0/24{Wh}")
+    print(f" {Wh}├─ Your device: {Gr}{local_ip}{Wh}")
+    if private_mac_devices:
+        print(f" {Wh}└─ Private MAC devices: {Ye}{len(private_mac_devices)}{Wh} (likely phones/tablets with MAC randomization)")
+    else:
+        print(f" {Wh}└─ Private MAC devices: {Gr}0{Wh}")
+    
+    # Legend
+    print(f"\n {Wh}Legend:")
+    print(f" {Wh}├─ {Ye}Yellow{Wh} = Device using private/randomized MAC (common on phones)")
+    print(f" {Wh}└─ {Cy}Cyan{Wh} = Device with identifiable MAC address")
+    
+    # Quick service scan for all hosts
+    quick_scan = input(f"\n {Wh}Scan running services on all hosts? {Gr}(Y/n){Wh}: ").strip().lower()
+    if quick_scan != 'n':
+        print(f"\n {Cy}Scanning for running services on each host...{Wh}\n")
+        
+        port_mapping = {
+            21: 'FTP', 22: 'SSH', 23: 'Telnet', 25: 'SMTP', 53: 'DNS',
+            80: 'HTTP', 110: 'POP3', 139: 'NetBIOS', 143: 'IMAP', 443: 'HTTPS',
+            445: 'SMB', 515: 'LPD', 548: 'AFP', 554: 'RTSP', 631: 'IPP',
+            993: 'IMAPS', 995: 'POP3S', 1883: 'MQTT', 1925: 'Philips TV',
+            2049: 'NFS', 3074: 'Xbox', 3306: 'MySQL', 3389: 'RDP',
+            3478: 'PlayStation', 5000: 'Synology', 5432: 'PostgreSQL',
+            5683: 'CoAP', 6379: 'Redis', 8008: 'Chromecast', 8080: 'HTTP-Alt',
+            8443: 'HTTPS-Alt', 8554: 'RTSP-Alt', 8883: 'MQTT-SSL',
+            9080: 'WebSocket', 9100: 'RAW Print', 27017: 'MongoDB', 5900: 'VNC'
+        }
+        
+        for idx, ip in enumerate(discovered_hosts, 1):
+            hostname = arp_hostnames.get(ip) or get_hostname(ip)
+            
+            # Truncate hostname
+            display_hostname = hostname if len(hostname) <= 20 else hostname[:17] + "..."
+            
+            print(f" {Wh}[{idx}/{len(discovered_hosts)}] {Gr}{ip:<16}{Wh} ({display_hostname}){Wh}", end='', flush=True)
+            
+            open_ports = scan_host_services(ip, port_mapping, timeout=0.3)
+            
+            if open_ports:
+                services = ', '.join([f"{port}/{service}" for port, service in sorted(open_ports)[:5]])
+                if len(open_ports) > 5:
+                    print(f" → {Gr}{services}{Wh}, +{len(open_ports)-5} more")
+                else:
+                    print(f" → {Gr}{services}{Wh}")
+            else:
+                print(f" → {Ye}No services detected{Wh}")
+    
+    # Store results for advanced features
+    scan_results = []
+    for ip in discovered_hosts:
+        mac = get_mac_address(ip)
+        hostname = arp_hostnames.get(ip) or get_hostname(ip)
+        vendor = get_vendor_from_mac(mac)
+        scan_results.append({
+            'ip': ip,
+            'mac': mac,
+            'hostname': hostname,
+            'vendor': vendor,
+            'is_local': ip == local_ip,
+            'private_mac': is_private_mac(mac)
+        })
+    
+    # Advanced options menu
+    while True:
+        print(f"\n {Cy}━━━ Advanced Options ━━━{Wh}")
+        print(f" {Wh}[1] 🔍 Deep scan (detect device types & services)")
+        print(f" {Wh}[2] 📡 Monitor mode (watch for new devices)")
+        print(f" {Wh}[3] 💾 Export results (JSON/HTML) - {Gr}{len(scan_results)} devices{Wh}")
+        print(f" {Wh}[4] 🌐 Online MAC lookup")
+        print(f" {Wh}[5] ⚡ Wake-on-LAN (wake a device)")
+        print(f" {Wh}[6] 🔄 Rescan network")
+        print(f" {Wh}[0] ← Back to main menu")
+        
+        choice = input(f"\n {Wh}Select option: {Gr}").strip()
+        
+        if choice == '0' or choice == '':
+            break
+        elif choice == '1':
+            deep_scan_devices(scan_results, local_ip)
+        elif choice == '2':
+            updated_results = monitor_network(network_range, local_ip, scan_results, ping_host, scan_host_socket, get_mac_address, get_hostname, get_vendor_from_mac, is_private_mac, arp_hostnames)
+            if updated_results:
+                # Update scan_results with new devices from monitoring
+                existing_ips = {d['ip'] for d in scan_results}
+                for device in updated_results:
+                    if device['ip'] not in existing_ips:
+                        scan_results.append(device)
+                    else:
+                        # Update existing device info
+                        for i, d in enumerate(scan_results):
+                            if d['ip'] == device['ip']:
+                                scan_results[i].update(device)
+                                break
+                # Remove devices that left
+                updated_ips = {d['ip'] for d in updated_results}
+                scan_results[:] = [d for d in scan_results if d['ip'] in updated_ips or d.get('is_local')]
+                print(f" {Gr}✓ Results updated with {len(scan_results)} devices{Wh}")
+        elif choice == '3':
+            export_scan_results(scan_results, network_range)
+        elif choice == '4':
+            online_mac_lookup(scan_results)
+        elif choice == '5':
+            wake_on_lan_menu(scan_results)
+        elif choice == '6':
+            return network_scanner()
+        else:
+            print(f" {Re}Invalid option.{Wh}")
+
+
+def scan_host_services(ip, port_list=None, timeout=0.3):
+    """Scan a single host for open ports and identify services."""
+    if port_list is None:
+        # Default comprehensive port list
+        port_list = {
+            21: 'FTP', 22: 'SSH', 23: 'Telnet', 25: 'SMTP', 53: 'DNS',
+            80: 'HTTP', 110: 'POP3', 139: 'NetBIOS', 143: 'IMAP', 443: 'HTTPS',
+            445: 'SMB', 515: 'LPD', 548: 'AFP', 554: 'RTSP', 631: 'IPP',
+            993: 'IMAPS', 995: 'POP3S', 1883: 'MQTT', 1925: 'Philips TV',
+            2049: 'NFS', 3074: 'Xbox', 3306: 'MySQL', 3389: 'RDP',
+            3478: 'PlayStation', 5000: 'Synology', 5432: 'PostgreSQL',
+            5683: 'CoAP', 6379: 'Redis', 8008: 'Chromecast', 8080: 'HTTP-Alt',
+            8443: 'HTTPS-Alt', 8554: 'RTSP-Alt', 8883: 'MQTT-SSL',
+            9080: 'WebSocket', 9100: 'RAW Print', 27017: 'MongoDB', 5900: 'VNC'
+        }
+    
+    open_ports = []
+    for port, service in port_list.items():
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((ip, port))
+            sock.close()
+            if result == 0:
+                open_ports.append((port, service))
+        except:
+            pass
+    
+    return open_ports
+
+
+def deep_scan_devices(scan_results, local_ip):
+    """Perform deep scan to detect device types and running services."""
+    print(f"\n {Cy}━━━ Deep Scan - Device Type Detection ━━━{Wh}")
+    print(f" {Wh}Scanning ports to identify device types...\n")
+    
+    # Port signatures for device type detection
+    device_signatures = {
+        'Router/Gateway': [80, 443, 53, 8080, 8443],
+        'Printer': [9100, 515, 631, 80],
+        'NAS/File Server': [445, 139, 548, 2049, 5000],
+        'Smart TV': [8008, 8443, 9080, 1925],
+        'Game Console': [3074, 3478, 3479, 3480],
+        'IP Camera': [554, 8554, 80, 8080],
+        'Web Server': [80, 443, 8080, 8443],
+        'SSH Server': [22],
+        'FTP Server': [21],
+        'Database': [3306, 5432, 27017, 6379],
+        'Mail Server': [25, 587, 993, 995],
+        'IoT Device': [1883, 8883, 5683],  # MQTT, CoAP
+    }
+    
+    service_names = {
+        21: 'FTP', 22: 'SSH', 23: 'Telnet', 25: 'SMTP', 53: 'DNS',
+        80: 'HTTP', 110: 'POP3', 139: 'NetBIOS', 143: 'IMAP', 443: 'HTTPS',
+        445: 'SMB', 515: 'LPD', 548: 'AFP', 554: 'RTSP', 631: 'IPP',
+        993: 'IMAPS', 995: 'POP3S', 1883: 'MQTT', 1925: 'Philips TV',
+        2049: 'NFS', 3074: 'Xbox', 3306: 'MySQL', 3389: 'RDP',
+        3478: 'PlayStation', 5000: 'Synology', 5432: 'PostgreSQL',
+        5683: 'CoAP', 6379: 'Redis', 8008: 'Chromecast', 8080: 'HTTP-Alt',
+        8443: 'HTTPS-Alt', 8554: 'RTSP-Alt', 8883: 'MQTT-SSL',
+        9080: 'WebSocket', 9100: 'RAW Print', 27017: 'MongoDB',
+    }
+    
+    ports_to_scan = list(set([p for ports in device_signatures.values() for p in ports]))
+    ports_to_scan.extend([3389, 5900, 23])  # RDP, VNC, Telnet
+    ports_to_scan = sorted(list(set(ports_to_scan)))
+    
+    for device in scan_results:
+        if device['is_local']:
+            continue
+            
+        ip = device['ip']
+        print(f" {Cy}Scanning {ip}...{Wh}", end='', flush=True)
+        
+        open_ports = []
+        for port in ports_to_scan:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.3)
+                result = sock.connect_ex((ip, port))
+                sock.close()
+                if result == 0:
+                    open_ports.append(port)
+            except:
+                pass
+        
+        # Determine device type
+        device_type = "Unknown Device"
+        type_scores = {}
+        
+        for dtype, signature_ports in device_signatures.items():
+            score = sum(1 for p in signature_ports if p in open_ports)
+            if score > 0:
+                type_scores[dtype] = score
+        
+        if type_scores:
+            device_type = max(type_scores, key=type_scores.get)
+        elif not open_ports:
+            if device['private_mac']:
+                device_type = "📱 Mobile Device"
+            else:
+                device_type = "Stealth/Firewall"
+        
+        # Display results
+        print(f"\r {Wh}┌─ {Gr}{ip}{Wh} ({device['hostname']})")
+        print(f" {Wh}│  Type: {Cy}{device_type}{Wh}")
+        print(f" {Wh}│  MAC: {device['mac']} ({device['vendor']})")
+        
+        if open_ports:
+            services = [f"{p}/{service_names.get(p, '?')}" for p in open_ports[:8]]
+            print(f" {Wh}│  Open: {Gr}{', '.join(services)}{Wh}")
+            if len(open_ports) > 8:
+                print(f" {Wh}│        +{len(open_ports)-8} more ports")
+        else:
+            print(f" {Wh}│  Open: {Ye}No common ports detected{Wh}")
+        
+        # Security warnings
+        warnings = []
+        if 23 in open_ports:
+            warnings.append("⚠️ Telnet (insecure)")
+        if 21 in open_ports:
+            warnings.append("⚠️ FTP (insecure)")
+        if 3389 in open_ports:
+            warnings.append("⚠️ RDP exposed")
+        if 5900 in open_ports:
+            warnings.append("⚠️ VNC exposed")
+        
+        if warnings:
+            print(f" {Wh}│  {Re}{' | '.join(warnings)}{Wh}")
+        
+        print(f" {Wh}└{'─' * 50}")
+        device['device_type'] = device_type
+        device['open_ports'] = open_ports
+
+
+def monitor_network(network_range, local_ip, initial_devices, ping_host, scan_host_socket, get_mac_address, get_hostname, get_vendor_from_mac, is_private_mac, arp_hostnames):
+    """Monitor network for new devices joining or leaving."""
+    import signal
+    import subprocess
+    
+    print(f"\n {Cy}━━━ Network Monitor Mode ━━━{Wh}")
+    print(f" {Wh}Watching for devices joining/leaving the network...")
+    print(f" {Ye}Press Ctrl+C to stop monitoring{Wh}\n")
+    
+    known_devices = {d['ip']: d for d in initial_devices}
+    scan_count = 0
+    stop_monitoring = False
+    
+    def signal_handler(sig, frame):
+        nonlocal stop_monitoring
+        stop_monitoring = True
+    
+    # Set up signal handler
+    old_handler = signal.signal(signal.SIGINT, signal_handler)
+    
+    def is_host_alive(ip):
+        """Check if host is alive using multiple fast methods."""
+        if stop_monitoring:
+            return False
+        
+        # Method 1: Quick TCP connect to common ports
+        quick_ports = [80, 443, 22, 7, 135, 445, 62078, 5353, 1900]
+        for port in quick_ports:
+            if stop_monitoring:
+                return False
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.1)
+                result = sock.connect_ex((ip, port))
+                sock.close()
+                if result == 0:
+                    return True
+            except:
+                pass
+        
+        # Method 2: Try UDP port (for devices that don't respond to TCP)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(0.1)
+            sock.sendto(b'', (ip, 5353))  # mDNS
+            sock.close()
+        except:
+            pass
+        
+        # Method 3: Check if in ARP table (device responded to something)
+        try:
+            result = subprocess.run(['arp', '-n', ip], capture_output=True, text=True, timeout=1)
+            if result.returncode == 0 and 'no entry' not in result.stdout.lower():
+                for line in result.stdout.split('\n'):
+                    if ip in line and '(incomplete)' not in line:
+                        return True
+        except:
+            pass
+        
+        return False
+    
+    def active_network_scan():
+        """Actively scan all IPs in network range using threads."""
+        alive_hosts = set()
+        
+        # First, send pings/packets to populate ARP table
+        try:
+            # Ping broadcast
+            subprocess.run(
+                ['ping', '-c', '1', '-b', '-W', '1', f'{network_range}.255'],
+                capture_output=True, timeout=2
+            )
+        except:
+            pass
+        
+        # Use nmap if available (most reliable)
+        try:
+            result = subprocess.run(
+                ['nmap', '-sn', '-n', '--host-timeout', '500ms', f'{network_range}.0/24'],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'Nmap scan report for' in line:
+                        ip = line.split()[-1]
+                        if ip.startswith(network_range):
+                            alive_hosts.add(ip)
+                if alive_hosts:
+                    return alive_hosts
+        except:
+            pass
+        
+        # Fallback: Threaded scan
+        def check_ip(ip):
+            if is_host_alive(ip):
+                return ip
+            return None
+        
+        with ThreadPoolExecutor(max_workers=100) as executor:
+            ips_to_scan = [f"{network_range}.{i}" for i in range(1, 255)]
+            futures = {executor.submit(check_ip, ip): ip for ip in ips_to_scan}
+            
+            for future in as_completed(futures, timeout=15):
+                if stop_monitoring:
+                    break
+                try:
+                    result = future.result(timeout=1)
+                    if result:
+                        alive_hosts.add(result)
+                except:
+                    pass
+        
+        # Also check ARP table for any devices we might have missed
+        try:
+            result = subprocess.run(['arp', '-n'], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[0].startswith(network_range):
+                        if '(incomplete)' not in line:
+                            alive_hosts.add(parts[0])
+        except:
+            pass
+        
+        try:
+            result = subprocess.run(['ip', 'neigh'], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    parts = line.split()
+                    if parts and parts[0].startswith(network_range):
+                        if 'REACHABLE' in line or 'STALE' in line or 'DELAY' in line:
+                            alive_hosts.add(parts[0])
+        except:
+            pass
+        
+        return alive_hosts
+    
+    print(f" {Wh}Initial devices: {Gr}{len(known_devices)}{Wh}")
+    print(f" {Wh}Performing active scans...\n")
+    
+    try:
+        while not stop_monitoring:
+            scan_count += 1
+            current_time = datetime.now().strftime("%H:%M:%S")
+            print(f"\r {Cy}[{current_time}] Scan #{scan_count} | Known: {len(known_devices)} | Scanning...{Wh}          ", end='', flush=True)
+            
+            if stop_monitoring:
+                break
+            
+            # Active scan for all devices
+            current_ips = active_network_scan()
+            
+            if stop_monitoring:
+                break
+            
+            known_ips = set(known_devices.keys())
+            
+            # Check for new devices
+            new_ips = current_ips - known_ips
+            for ip in new_ips:
+                if stop_monitoring:
+                    break
+                mac = get_mac_address(ip)
+                hostname = get_hostname(ip)
+                vendor = get_vendor_from_mac(mac)
+                
+                print(f"\n\n {Gr}{'='*50}")
+                print(f" {Gr}[+] NEW DEVICE JOINED THE NETWORK!{Wh}")
+                print(f" {Gr}{'='*50}{Wh}")
+                print(f"     📍 IP Address : {Gr}{ip}{Wh}")
+                print(f"     🔗 MAC Address: {Cy}{mac}{Wh}")
+                print(f"     🏷️  Hostname   : {Ye}{hostname}{Wh}")
+                print(f"     🏭 Vendor     : {Mage}{vendor}{Wh}")
+                if is_private_mac(mac):
+                    print(f"     📱 {Ye}(Private MAC - likely phone/tablet){Wh}")
+                print(f" {Gr}{'='*50}{Wh}\n")
+                
+                known_devices[ip] = {
+                    'ip': ip,
+                    'mac': mac,
+                    'hostname': hostname,
+                    'vendor': vendor,
+                    'private_mac': is_private_mac(mac)
+                }
+            
+            # Check for devices that left
+            gone_ips = known_ips - current_ips - {local_ip}
+            for ip in list(gone_ips):
+                if stop_monitoring:
+                    break
+                print(f"\n\n {Re}{'='*50}")
+                print(f" {Re}[-] DEVICE LEFT THE NETWORK{Wh}")
+                print(f" {Re}{'='*50}{Wh}")
+                print(f"     📍 IP Address : {Re}{ip}{Wh}")
+                old_device = known_devices.get(ip, {})
+                if old_device:
+                    print(f"     🔗 MAC Address: {old_device.get('mac', 'Unknown')}")
+                    print(f"     🏷️  Hostname   : {old_device.get('hostname', 'Unknown')}")
+                print(f" {Re}{'='*50}{Wh}\n")
+                del known_devices[ip]
+            
+            print(f"\r {Cy}[{current_time}] Scan #{scan_count} | Known: {len(known_devices)} | Next scan in 5s...{Wh}    ", end='', flush=True)
+            
+            # Interruptible sleep
+            for _ in range(10):
+                if stop_monitoring:
+                    break
+                time.sleep(0.5)
+            
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"\n {Re}Error: {e}{Wh}")
+    finally:
+        signal.signal(signal.SIGINT, old_handler)
+    
+    print(f"\n\n {Ye}━━━ Monitoring Stopped ━━━{Wh}")
+    print(f" {Wh}Final device count: {Gr}{len(known_devices)}{Wh}")
+    
+    # Return updated device list
+    return list(known_devices.values())
+
+
+def export_scan_results(scan_results, network_range):
+    """Export scan results to JSON or HTML file."""
+    print(f"\n {Cy}━━━ Export Results ━━━{Wh}")
+    print(f" {Wh}[1] Export as JSON")
+    print(f" {Wh}[2] Export as HTML report")
+    print(f" {Wh}[0] Cancel")
+    
+    choice = input(f"\n {Wh}Select format: {Gr}").strip()
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    if choice == '1':
+        filename = f"network_scan_{timestamp}.json"
+        export_data = {
+            'scan_time': datetime.now().isoformat(),
+            'network': f"{network_range}.0/24",
+            'devices': scan_results
+        }
+        try:
+            with open(filename, 'w') as f:
+                json.dump(export_data, f, indent=2)
+            print(f" {Gr}✓ Exported to {filename}{Wh}")
+        except Exception as e:
+            print(f" {Re}Error: {e}{Wh}")
+            
+    elif choice == '2':
+        filename = f"network_scan_{timestamp}.html"
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Network Scan Report - {datetime.now().strftime("%Y-%m-%d %H:%M")}</title>
+    <style>
+        body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 40px; background: #1a1a2e; color: #eee; }}
+        h1 {{ color: #00d4ff; border-bottom: 2px solid #00d4ff; padding-bottom: 10px; }}
+        h2 {{ color: #00ff88; }}
+        table {{ border-collapse: collapse; width: 100%; margin: 20px 0; background: #16213e; }}
+        th, td {{ border: 1px solid #0f3460; padding: 12px; text-align: left; }}
+        th {{ background: #0f3460; color: #00d4ff; }}
+        tr:hover {{ background: #1a1a4e; }}
+        .local {{ background: #1e4d2b !important; }}
+        .private-mac {{ color: #ffd700; }}
+        .summary {{ background: #0f3460; padding: 20px; border-radius: 8px; margin: 20px 0; }}
+        .footer {{ margin-top: 30px; color: #666; font-size: 12px; }}
+    </style>
+</head>
+<body>
+    <h1>🌐 Network Scan Report</h1>
+    <div class="summary">
+        <h2>Summary</h2>
+        <p><strong>Network:</strong> {network_range}.0/24</p>
+        <p><strong>Scan Time:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+        <p><strong>Devices Found:</strong> {len(scan_results)}</p>
+        <p><strong>Private MAC Devices:</strong> {sum(1 for d in scan_results if d.get('private_mac'))}</p>
+    </div>
+    
+    <h2>📋 Discovered Devices</h2>
+    <table>
+        <tr>
+            <th>#</th>
+            <th>IP Address</th>
+            <th>MAC Address</th>
+            <th>Hostname</th>
+            <th>Vendor</th>
+            <th>Notes</th>
+        </tr>
+"""
+        for idx, device in enumerate(scan_results, 1):
+            row_class = 'local' if device.get('is_local') else ''
+            mac_class = 'private-mac' if device.get('private_mac') else ''
+            notes = []
+            if device.get('is_local'):
+                notes.append('This device')
+            if device.get('private_mac'):
+                notes.append('Private MAC')
+            if device.get('device_type'):
+                notes.append(device['device_type'])
+            
+            html_content += f"""        <tr class="{row_class}">
+            <td>{idx}</td>
+            <td>{device['ip']}</td>
+            <td class="{mac_class}">{device['mac']}</td>
+            <td>{device['hostname']}</td>
+            <td>{device['vendor']}</td>
+            <td>{', '.join(notes)}</td>
+        </tr>
+"""
+        
+        html_content += """    </table>
+    <div class="footer">
+        <p>Generated by NexRecon Network Scanner</p>
+    </div>
+</body>
+</html>"""
+        
+        try:
+            with open(filename, 'w') as f:
+                f.write(html_content)
+            print(f" {Gr}✓ Exported to {filename}{Wh}")
+            print(f" {Cy}Open in browser to view the report{Wh}")
+        except Exception as e:
+            print(f" {Re}Error: {e}{Wh}")
+    else:
+        print(f" {Ye}Export cancelled.{Wh}")
+
+
+def online_mac_lookup(scan_results):
+    """Lookup MAC vendor information online."""
+    print(f"\n {Cy}━━━ Online MAC Vendor Lookup ━━━{Wh}")
+    print(f" {Wh}Querying online database for unknown vendors...\n")
+    
+    for device in scan_results:
+        mac = device['mac']
+        if mac == "Unknown":
+            continue
+        if device['vendor'] not in ['Unknown Vendor', 'Private MAC', 'Unknown']:
+            continue
+        if device.get('private_mac'):
+            print(f" {Ye}Skipping {device['ip']} (Private/Randomized MAC){Wh}")
+            continue
+            
+        print(f" {Wh}Looking up {mac}...", end='', flush=True)
+        
+        try:
+            # Using macvendors.com API
+            response = requests.get(
+                f"https://api.macvendors.com/{mac}",
+                timeout=5,
+                headers={'User-Agent': 'NexRecon/1.0'}
+            )
+            if response.status_code == 200:
+                vendor = response.text.strip()
+                device['vendor'] = vendor
+                print(f" {Gr}{vendor}{Wh}")
+            elif response.status_code == 404:
+                print(f" {Ye}Not found in database{Wh}")
+            else:
+                print(f" {Re}API error{Wh}")
+            time.sleep(1)  # Rate limiting
+        except Exception as e:
+            print(f" {Re}Error: {e}{Wh}")
+    
+    print(f"\n {Gr}✓ Lookup complete{Wh}")
+
+
+def wake_on_lan_menu(scan_results):
+    """Send Wake-on-LAN magic packet to wake a device."""
+    print(f"\n {Cy}━━━ Wake-on-LAN ━━━{Wh}")
+    print(f" {Wh}Send magic packet to wake a sleeping device.\n")
+    
+    # List devices with known MAC
+    valid_devices = [(i, d) for i, d in enumerate(scan_results, 1) 
+                     if d['mac'] != 'Unknown' and not d.get('is_local')]
+    
+    if not valid_devices:
+        print(f" {Ye}No devices with known MAC addresses found.{Wh}")
+        return
+    
+    print(f" {Wh}Available devices:")
+    for idx, device in valid_devices:
+        print(f"   [{idx}] {device['ip']} - {device['mac']} ({device['hostname']})")
+    
+    print(f"\n   [M] Enter MAC manually")
+    print(f"   [0] Cancel")
+    
+    choice = input(f"\n {Wh}Select device or enter MAC: {Gr}").strip()
+    
+    if choice == '0':
+        return
+    
+    mac_to_wake = None
+    
+    if choice.upper() == 'M':
+        mac_to_wake = input(f" {Wh}Enter MAC address: {Gr}").strip()
+    else:
+        try:
+            idx = int(choice)
+            for i, d in valid_devices:
+                if i == idx:
+                    mac_to_wake = d['mac']
+                    break
+        except:
+            print(f" {Re}Invalid selection.{Wh}")
+            return
+    
+    if not mac_to_wake:
+        print(f" {Re}No MAC address specified.{Wh}")
+        return
+    
+    # Clean MAC address
+    mac_clean = mac_to_wake.replace(':', '').replace('-', '').replace('.', '').upper()
+    
+    if len(mac_clean) != 12:
+        print(f" {Re}Invalid MAC address format.{Wh}")
+        return
+    
+    try:
+        # Build magic packet
+        mac_bytes = bytes.fromhex(mac_clean)
+        magic_packet = b'\xff' * 6 + mac_bytes * 16
+        
+        # Send to broadcast
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.sendto(magic_packet, ('255.255.255.255', 9))
+        sock.close()
+        
+        print(f"\n {Gr}✓ Magic packet sent to {mac_to_wake}{Wh}")
+        print(f" {Wh}If the device supports WoL and is connected via Ethernet,")
+        print(f" {Wh}it should wake up within a few seconds.{Wh}")
+        
+    except Exception as e:
+        print(f" {Re}Error sending packet: {e}{Wh}")
+
+
+@is_option
 def port_scanner():
     """Scan common ports on a target host."""
     target = input(f"\n {Wh}Enter target IP or domain: {Gr}").strip()
@@ -1330,6 +4690,7 @@ MENU_CATEGORIES = [
             {'num': 2, 'text': 'Show Your IP', 'func': showIP, 'desc': 'Display your public IP'},
             {'num': 8, 'text': 'Port Scanner', 'func': port_scanner, 'desc': 'Scan open ports'},
             {'num': 9, 'text': 'Subnet Calculator', 'func': subnet_calculator, 'desc': 'Calculate network ranges'},
+            {'num': 15, 'text': 'Network Scanner', 'func': network_scanner, 'desc': 'Scan local network devices'},
         ]
     },
     {
@@ -1340,6 +4701,8 @@ MENU_CATEGORIES = [
             {'num': 4, 'text': 'Username Search', 'func': TrackLu, 'desc': 'Find social profiles'},
             {'num': 5, 'text': 'WHOIS Lookup', 'func': whois_lookup, 'desc': 'Domain registration info'},
             {'num': 6, 'text': 'DNS Lookup', 'func': dns_lookup, 'desc': 'Query DNS records'},
+            {'num': 13, 'text': 'Email Footprint', 'func': email_footprint, 'desc': 'Find email associations'},
+            {'num': 14, 'text': 'Phone Footprint', 'func': phone_footprint, 'desc': 'Find phone associations'},
         ]
     },
     {

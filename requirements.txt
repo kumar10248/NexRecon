@@ -9,3 +9,6 @@ phonenumbers>=8.13.0
 
 # Image metadata extraction (EXIF)
 Pillow>=9.0.0
+# Optional: For faster async email footprint checking (holehe-style)
+# httpx>=0.24.0
+# trio>=0.22.0
